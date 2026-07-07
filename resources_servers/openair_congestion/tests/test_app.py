@@ -23,6 +23,7 @@ import json
 import math
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 
 from nemo_gym.openai_utils import (
@@ -259,6 +260,96 @@ class TestRoutes:
         env = _make_env()
         routes = {r.path for r in env.setup_webserver().routes}
         assert {"/reset", "/step", "/aggregate_metrics"}.issubset(routes)
+
+
+def _http_client(app) -> httpx.AsyncClient:
+    # In-process ASGI transport (as in aviary's tests): real /reset and /step
+    # requests through routing, request parsing, and the session middleware,
+    # no live socket. Each AsyncClient keeps its own cookie jar, so each
+    # client is one session.
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver")
+
+
+def _reset_body(**overrides) -> dict:
+    # EnvResetRequest: responses_create_params plus task-row extras.
+    body = {"responses_create_params": {"input": []}, **_TASK_METADATA}
+    body.update(overrides)
+    return body
+
+
+def _step_body(name: str, arguments: dict) -> dict:
+    # EnvStepRequest: responses_create_params plus the model's response.
+    return {"responses_create_params": {"input": []}, "response": _tool_response(name, arguments).model_dump()}
+
+
+class TestHTTPSurface:
+    @pytest.mark.asyncio
+    async def test_interleaved_sessions_step_independently_over_http(self):
+        # Two clients (= two session cookies) with interleaved /step calls:
+        # each must advance only its own episode, with no state bleed.
+        env = _make_env()
+        app = env.setup_webserver()
+        async with _http_client(app) as client_a, _http_client(app) as client_b:
+            episode_a = (await client_a.post("/reset", json=_reset_body())).json()["info"]["episode_id"]
+            episode_b = (await client_b.post("/reset", json=_reset_body(seed=7002))).json()["info"]["episode_id"]
+            assert episode_a != episode_b
+            assert len(env.session_state) == 2
+            expected = {id(client_a): episode_a, id(client_b): episode_b}
+            steps_taken = {id(client_a): 0, id(client_b): 0}
+            for client in (client_a, client_b, client_a, client_b, client_a):
+                response = await client.post("/step", json=_step_body("noop", {}))
+                assert response.status_code == 200
+                info = response.json()["info"]
+                steps_taken[id(client)] += 1
+                assert info["episode_id"] == expected[id(client)]
+                assert info["n_steps"] == steps_taken[id(client)]
+
+    @pytest.mark.asyncio
+    async def test_same_task_row_twice_yields_identical_episode_over_http(self):
+        # Offline determinism at the HTTP surface: the same task row and
+        # action sequence must reproduce the observation and reward sequence
+        # exactly (fresh session each run; episode_ids differ, so info is
+        # excluded from the comparison).
+        env = _make_env()
+        app = env.setup_webserver()
+        actions = [
+            ("set_ul_power_control", {"cell_id": 0, "p0_dbm": -90, "alpha": 0.8}),
+            ("noop", {}),
+            ("set_prb_cap", {"cell_id": 0, "target": "ue", "target_id": 0, "max_prb": 120}),
+        ]
+
+        async def run_episode() -> list:
+            async with _http_client(app) as client:
+                trace = [(await client.post("/reset", json=_reset_body())).json()["observation"]]
+                for name, arguments in actions:
+                    body = (await client.post("/step", json=_step_body(name, arguments))).json()
+                    trace.append((body["observation"], body["reward"], body["terminated"], body["truncated"]))
+                return trace
+
+        assert await run_episode() == await run_episode()
+
+    @pytest.mark.asyncio
+    async def test_pool_exhaustion_reaps_orphans_over_http(self):
+        # HTTP counterpart of the in-process reaper test: with a live session
+        # holding the only slot, a second /reset fails pool-exhausted; once
+        # that session dies without close_session() (crashed rollout), the
+        # reaper reclaims its slot and the retry succeeds.
+        env = _make_env(pool_size=1)
+        app = env.setup_webserver()
+        async with _http_client(app) as client_dead, _http_client(app) as client_new:
+            episode_dead = (await client_dead.post("/reset", json=_reset_body())).json()["info"]["episode_id"]
+            # The server registers no exception middleware, so the pool-exhausted
+            # RuntimeError tunnels through the in-process ASGI transport; a
+            # client on a real socket would see a 500 instead.
+            with pytest.raises(RuntimeError, match="pool exhausted"):
+                await client_new.post("/reset", json=_reset_body(seed=7002))
+            # Simulate the crash: the session vanishes without close_session().
+            del env.session_state[next(iter(env.session_state))]
+            response = await client_new.post("/reset", json=_reset_body(seed=7002))
+            assert response.status_code == 200
+            info = response.json()["info"]
+            assert info["episode_id"] != episode_dead
+            assert env.session_state[next(iter(env.session_state))]["episode_id"] == info["episode_id"]
 
 
 class TestBackends:

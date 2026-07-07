@@ -124,6 +124,14 @@ ng_collect_rollouts \
 
 Add `+limit=1` for a quick single-episode test.
 
+### Scripted client demo
+
+`client.py` drives one full episode over the real HTTP surface -- POST `/reset`, then a `/step` loop -- using a scripted congestion-relief heuristic instead of an LLM, printing each step's tool call, guardrail verdict, and reward, then the episode return. With a gym up (step 1) it connects to the served instance; without one it boots a local in-process server on the replay backend, so it runs fully offline:
+
+```bash
+python resources_servers/openair_congestion/client.py
+```
+
 ### Run tests
 
 ```bash
@@ -132,6 +140,8 @@ ng_test +entrypoint=resources_servers/openair_congestion
 # Or directly (the env package must be importable -- see Setup):
 pytest resources_servers/openair_congestion/tests -q
 ```
+
+`tests/test_reward_correctness.py` is the reward oracle: on fixed replay seeds, scripted congestion relief must out-return random valid play, which must out-return `noop`, which must out-return always-rejected catastrophic play; per step, clearing an SLA violation, dropping PRB below the pressure threshold, or draining buffers never scores lower, and a rejected action always scores below the same step accepted. All assertions are relative orderings, never absolute thresholds, so a reward renormalization does not invalidate them.
 
 ## Verification
 
