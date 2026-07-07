@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# NeMo-Gym itself (editable), same as the other resources_servers.
+-e nemo-gym[dev] @ ../../
+
+# Cross-repo telco env package. Lives in the openair-rl-gym repo and is not
+# on PyPI; install editable from a local checkout before starting the server
+# (runtime deps of the replay path: pydantic + numpy):
+#   pip install -e <openair-rl-gym>/env/nemo_gym/envs/openair_congestion
+# Tests skip (not fail) when the package is missing.
