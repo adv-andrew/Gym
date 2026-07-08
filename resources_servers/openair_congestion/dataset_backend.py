@@ -506,6 +506,7 @@ def trace_row_to_snapshot(
         "_source_iter": row.get("iter"),
         "_source_tool_sent": row.get("tool_sent"),
         "_source_action_accepted": _recorded_action_accepted(row),
+        "_source_rejection_reason": row.get("rejection_reason"),
         "_source_scenario_mode": topology.scenario_mode,
         "_reconstruction_schema": TRACE_RECONSTRUCTION_SCHEMA,
         "_reconstruction_topology_source": topology.source,
@@ -593,6 +594,7 @@ class EpisodeSource:
     source_scenario_mode: Optional[str] = None
     initial_history_action: Optional[ToolCall] = None
     initial_history_action_accepted: bool = False
+    initial_history_rejection_reason: Optional[str] = None
 
 
 def _order_value(path: Path, row: dict[str, Any], key: str) -> float:
@@ -743,11 +745,15 @@ def load_provided_dataset(path: str | Path) -> dict[str, EpisodeSource]:
         first_row = group[0]
         initial_action = None
         initial_action_accepted = False
+        initial_rejection_reason = None
         if trace_format:
             raw_initial_action = first_row.get("_source_tool_sent")
             if raw_initial_action is not None:
                 initial_action = ToolCall.model_validate(raw_initial_action)
             initial_action_accepted = bool(first_row.get("_source_action_accepted"))
+            raw_rejection_reason = first_row.get("_source_rejection_reason")
+            if raw_rejection_reason is not None:
+                initial_rejection_reason = str(raw_rejection_reason)
         episodes[key] = EpisodeSource(
             observations=obs_list,
             cell_capacity_mbps_by_observation=capacities,
@@ -760,6 +766,7 @@ def load_provided_dataset(path: str | Path) -> dict[str, EpisodeSource]:
             ),
             initial_history_action=initial_action,
             initial_history_action_accepted=initial_action_accepted,
+            initial_history_rejection_reason=initial_rejection_reason,
         )
     if not episodes:
         raise ValueError(f"dataset file {path} contains no rows")
@@ -962,6 +969,30 @@ class DatasetReplayBackend(Backend):
             # Re-stamp observations with the real episode id (frozen models:
             # model_copy(update=...), same pattern ReplayEnv uses at reset).
             trajectory = [obs.model_copy(update={"episode_id": episode_id}) for obs in source.observations]
+
+            # Trace row 0 is already the observation *after* its recorded
+            # action. The accepted action is seeded into guardrail history
+            # below, so expose the same action in the initial observation's L
+            # row. Otherwise the first policy turn can be rejected for an
+            # identical repeat of state that was invisible to the policy.
+            if source.initial_history_action is not None:
+                initial_rejection = (
+                    None
+                    if source.initial_history_action_accepted
+                    else source.initial_history_rejection_reason or "recorded_rejection_reason_unavailable"
+                )
+                trajectory[0] = trajectory[0].model_copy(
+                    update={
+                        "agent_aux": AgentAux(
+                            last_action=LastActionEcho(
+                                name=source.initial_history_action.name,
+                                arguments=dict(source.initial_history_action.arguments),
+                            ),
+                            last_rejection=initial_rejection,
+                            step_idx=0,
+                        )
+                    }
+                )
 
             # A trajectory of N observations supports N-1 (prev, curr) steps.
             budget = int(task_params.get("max_steps") or self.max_steps_default)

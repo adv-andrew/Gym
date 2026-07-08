@@ -33,6 +33,7 @@ openair = pytest.importorskip(
 
 from openair_congestion.schemas import Observation, ToolCall  # noqa: E402
 
+from resources_servers.openair_congestion.app import _to_resource_compact_pipe_v1  # noqa: E402
 from resources_servers.openair_congestion.backends import select_backend  # noqa: E402
 from resources_servers.openair_congestion.dataset_backend import (  # noqa: E402
     DATASET_DYNAMICS_MODE,
@@ -468,6 +469,19 @@ class TestTraceLoader:
             reward_profile="openair_v2_measured",
             reward_weights={"w_sla": 0.0, "w_sla_level": 0.0, "w_buffer": 0.0, "w_action": 0.0},
         )
+        initial_obs, meta = backend.reset({"scenario_id": "amparo"})
+        assert initial_obs.agent_aux.last_action.model_dump() == cell0
+        assert initial_obs.agent_aux.last_rejection is None
+        compact = _to_resource_compact_pipe_v1(initial_obs)
+        assert 'L|set_prb_cap|{"cell_id":0,"max_prb":10,"target":"ue","target_id":0}|none' in compact
+
+        # The seeded row-0 history is now observable before it can reject the
+        # same first-turn action.
+        _, _, _, repeated_info = backend.step(meta.episode_id, ToolCall(**cell0))
+        assert repeated_info["guardrail_accepted"] is False
+        assert "identical-action repeat" in repeated_info["rejection_reason"]
+        backend.close(meta.episode_id)
+
         _, meta = backend.reset({"scenario_id": "amparo"})
         reset_receipt = backend.episode_receipt_info(meta.episode_id)
         assert reset_receipt["reconstruction_schema"] == "aggregate_trace_multicell_proxy_v1"
