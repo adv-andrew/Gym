@@ -32,7 +32,8 @@ openair_congestion:
       # exceed the gymnasium_agent max_steps below.
       agent_max_steps: 16
       # Existing Gym/model-server flows retain the verbose representation.
-      # The standalone local-GRPO launcher defaults to t2_compact_pipe_v2.
+      # The standalone dataset-GRPO launcher defaults to resource_compact_pipe_v1;
+      # strict t2_compact_pipe_v2 requires the newer telco package and T2 state.
       observation_render: verbose_v1
       # dataset_replay knobs — flip `backend: dataset_replay` and point
       # dataset_path at a recorded JSONL (KPI snapshots or GRPO rollout

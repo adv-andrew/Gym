@@ -35,7 +35,7 @@ def test_named_measured_profile_builds_sealed_validated_config():
     assert config.reward_weights.w_sla_level == 0.0
     assert config.reward_weights.w_buffer == 0.0
     assert config.reward_weights.w_action == 0.0
-    assert config.observation_render == "t2_compact_pipe_v2"
+    assert config.observation_render == "resource_compact_pipe_v1"
 
 
 def test_custom_profile_requires_explicit_weights():

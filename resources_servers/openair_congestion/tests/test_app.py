@@ -212,11 +212,21 @@ class TestReset:
         assert info["observation_render"] == "verbose_v1"
 
     @pytest.mark.asyncio
-    async def test_compact_observation_render_is_selected_and_stamped(self):
-        env = _make_env(observation_render="t2_compact_pipe_v2")
+    async def test_resource_compact_observation_render_is_selected_and_stamped(self):
+        env = _make_env(observation_render="resource_compact_pipe_v1")
         obs, info = await env.reset(dict(_TASK_METADATA), session_id="sid")
         assert obs.startswith("T|")
         assert "A|one_tool_call_or_noop" in obs
+        assert info["observation_render"] == "resource_compact_pipe_v1"
+
+    @pytest.mark.asyncio
+    async def test_strict_t2_render_delegates_to_telco_renderer(self, monkeypatch):
+        import resources_servers.openair_congestion.app as app_module
+
+        monkeypatch.setattr(app_module, "_load_t2_compact_renderer", lambda: lambda _: "strict-t2")
+        env = _make_env(observation_render="t2_compact_pipe_v2")
+        obs, info = await env.reset(dict(_TASK_METADATA), session_id="sid")
+        assert obs == "strict-t2"
         assert info["observation_render"] == "t2_compact_pipe_v2"
 
 
@@ -526,6 +536,10 @@ class TestConfigValidation:
                     "w_buffer": 0.0,
                     "w_action": 0.0,
                 },
+            },
+            {
+                "backend": "dataset_replay",
+                "observation_render": "t2_compact_pipe_v2",
             },
         ],
     )

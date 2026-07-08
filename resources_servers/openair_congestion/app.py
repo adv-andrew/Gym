@@ -35,7 +35,8 @@ from __future__ import annotations
 
 import json
 import math
-from typing import Any, Literal, Optional
+from functools import lru_cache
+from typing import Any, Callable, Literal, Optional
 
 from fastapi import FastAPI, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -76,8 +77,8 @@ class RewardWeightOverrides(BaseModel):
     w_reject: Optional[float] = Field(default=None, ge=0.0, allow_inf_nan=False)
 
 
-def _to_compact_pipe_v2(observation: Any) -> str:
-    """Render the stable T/C/U/L/A subset of the T2 compact pipe contract.
+def _to_resource_compact_pipe_v1(observation: Any) -> str:
+    """Render the resource server's stable T/C/U/L/A compact contract.
 
     The published resource server supports older packaged telco environments
     that predate the T2 policy-feature module. Aggregate dataset traces also do
@@ -118,6 +119,21 @@ def _to_compact_pipe_v2(observation: Any) -> str:
     return "\n".join(lines)
 
 
+@lru_cache(maxsize=1)
+def _load_t2_compact_renderer() -> Callable[[Any], str]:
+    """Load the qualified T2 renderer or fail before the server accepts work."""
+    try:
+        from openair_congestion.render import to_compact_user_text
+    except ImportError as exc:
+        raise RuntimeError(
+            "observation_render='t2_compact_pipe_v2' requires a telco env package "
+            "that exports openair_congestion.render.to_compact_user_text with "
+            "truthful T2 P/D policy rows; use 'resource_compact_pipe_v1' for "
+            "aggregate dataset replay"
+        ) from exc
+    return to_compact_user_text
+
+
 class OpenAirCongestionResourcesServerConfig(BaseResourcesServerConfig):
     model_config = ConfigDict(extra="forbid")
 
@@ -143,7 +159,11 @@ class OpenAirCongestionResourcesServerConfig(BaseResourcesServerConfig):
     cell_capacity_mbps: float = Field(default=60.0, gt=0.0, allow_inf_nan=False)
     reward_profile: Literal["openair_v1", "openair_v2_measured", "custom"] = "openair_v1"
     reward_weights: Optional[RewardWeightOverrides] = None
-    observation_render: Literal["verbose_v1", "t2_compact_pipe_v2"] = "verbose_v1"
+    observation_render: Literal[
+        "verbose_v1",
+        "resource_compact_pipe_v1",
+        "t2_compact_pipe_v2",
+    ] = "verbose_v1"
     # Truncation-budget fallback for task rows that omit max_steps. Must not
     # exceed the gymnasium_agent's max_steps in the yaml: the agent truncates
     # client-side without notifying the env, so a larger server budget would
@@ -168,6 +188,11 @@ class OpenAirCongestionResourcesServerConfig(BaseResourcesServerConfig):
                 "reward_profile/reward_weights apply only to backend='dataset_replay'; "
                 f"backend={self.backend!r} uses its environment-owned default reward"
             )
+        if self.backend == "dataset_replay" and self.observation_render == "t2_compact_pipe_v2":
+            raise ValueError(
+                "backend='dataset_replay' cannot truthfully emit t2_compact_pipe_v2 P/D rows; "
+                "use observation_render='resource_compact_pipe_v1'"
+            )
         return self
 
 
@@ -182,6 +207,10 @@ class OpenAirCongestionEnv(GymnasiumServer):
 
     def model_post_init(self, __context: Any) -> None:
         super().model_post_init(__context)
+        if self.config.observation_render == "t2_compact_pipe_v2":
+            # Resolve at boot, not on the first rollout, so a stale telco env
+            # cannot advertise the qualified T2 contract and fail mid-run.
+            _load_t2_compact_renderer()
         self._backend = select_backend(self.config)
 
     @property
@@ -200,8 +229,10 @@ class OpenAirCongestionEnv(GymnasiumServer):
         }
 
     def _render_observation(self, observation: Any) -> str:
+        if self.config.observation_render == "resource_compact_pipe_v1":
+            return _to_resource_compact_pipe_v1(observation)
         if self.config.observation_render == "t2_compact_pipe_v2":
-            return _to_compact_pipe_v2(observation)
+            return _load_t2_compact_renderer()(observation)
         return to_user_text(observation)
 
     def setup_webserver(self) -> FastAPI:

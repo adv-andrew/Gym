@@ -139,11 +139,11 @@ python -m resources_servers.openair_congestion.serve \
   --backend dataset_replay \
   --dataset-path /absolute/path/to/train.jsonl \
   --reward-profile openair_v2_measured \
-  --observation-render t2_compact_pipe_v2 \
+  --observation-render resource_compact_pipe_v1 \
   --max-steps 12 --pool-size 64 --port 9110
 ```
 
-Use `--backend replay --port 9111` for an action-responsive synthetic comparison. `verbose_v1` and `t2_compact_pipe_v2` are explicit observation-render choices; the standalone launcher defaults to the compact form while the catalog YAML retains the verbose form. On this resource surface the compact representation is the truthful T/C/U/L/A subset: aggregate traces do not contain the capacity/candidate state needed for T2 P/D rows, so the server does not fabricate them. The `/reset` and `/step` responses expose backend/dynamics semantics, the selected render, effective reward weights, and (for datasets) SHA-256 identity, row/episode counts, reconstruction schema/topology/assumptions, transition capacity, and dataset key/index.
+Use `--backend replay --port 9111` for an action-responsive synthetic comparison. Three observation contracts are explicit: `verbose_v1`; `resource_compact_pipe_v1`, the truthful T/C/U/L/A resource form and standalone default; and strict `t2_compact_pipe_v2`, which delegates to the qualified telco renderer and includes P/D rows. Aggregate traces do not contain the capacity/candidate state needed for truthful P/D rows, so dataset replay must use the resource form. Selecting strict T2 fails at server startup when the installed telco package lacks that renderer; use it only with a real T2 observation source. The catalog YAML retains the verbose form. The `/reset` and `/step` responses expose backend/dynamics semantics, the selected render, effective reward weights, and (for datasets) SHA-256 identity, row/episode counts, reconstruction schema/topology/assumptions, transition capacity, and dataset key/index.
 
 Malformed, missing, or multiple tool calls consume one transition and receive the backend's ordinary guardrail-rejection penalty. This closes the shortcut where a policy could skip a negative recorded KPI transition by emitting no valid call.
 
