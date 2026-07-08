@@ -53,6 +53,7 @@ from __future__ import annotations
 import os
 import threading
 from abc import ABC, abstractmethod
+from dataclasses import asdict
 from typing import Any, Optional, Protocol
 
 
@@ -69,6 +70,7 @@ except ImportError as exc:  # pragma: no cover - exercised only when unpackaged
         "See resources_servers/openair_congestion/README.md (Setup)."
     ) from exc
 
+from openair_congestion import rewards as _rewards  # noqa: E402
 from openair_congestion.replay_env import ReplayEnv  # noqa: E402
 from openair_congestion.schemas import EpisodeMeta, Observation, ToolCall  # noqa: E402
 
@@ -129,6 +131,19 @@ class Backend(ABC):
     action_affects_observation = False
     reward_profile = "unknown"
 
+    def receipt_info(self) -> dict[str, Any]:
+        """Return immutable backend semantics included in every HTTP receipt."""
+        return {
+            "backend": self.backend_name,
+            "dynamics_mode": self.dynamics_mode,
+            "action_affects_observation": self.action_affects_observation,
+            "reward_profile": self.reward_profile,
+        }
+
+    def episode_receipt_info(self, episode_id: str) -> dict[str, Any]:
+        """Return episode-specific provenance for reset receipts, if any."""
+        return {}
+
     @abstractmethod
     def reset(
         self, task_params: dict[str, Any], *, live_episode_ids: Optional[set[str]] = None
@@ -173,6 +188,12 @@ class ReplayBackend(Backend):
     dynamics_mode = "synthetic_action_effect_v1"
     action_affects_observation = True
     reward_profile = "env_default"
+
+    def receipt_info(self) -> dict[str, Any]:
+        return {
+            **super().receipt_info(),
+            "reward_weights": asdict(_rewards.DEFAULT_WEIGHTS),
+        }
 
     def __init__(
         self,

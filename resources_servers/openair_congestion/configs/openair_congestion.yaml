@@ -31,6 +31,9 @@ openair_congestion:
       # Truncation-budget fallback for task rows that omit max_steps; must not
       # exceed the gymnasium_agent max_steps below.
       agent_max_steps: 16
+      # Existing Gym/model-server flows retain the verbose representation.
+      # The standalone local-GRPO launcher defaults to t2_compact_pipe_v2.
+      observation_render: verbose_v1
       # dataset_replay knobs — flip `backend: dataset_replay` and point
       # dataset_path at a recorded JSONL (KPI snapshots or GRPO rollout
       # traces, auto-detected; see README, Dataset Formats). Task rows must

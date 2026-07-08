@@ -172,7 +172,7 @@ class TestTraceLoader:
 
     def test_aggregates_reconstruct_recorded_measurements(self):
         # Step 1 of ep_000341 carries the full measurement set; the
-        # reconstructed single-cell observation must reproduce every
+        # reconstructed observation must reproduce every
         # aggregate that trace row recorded.
         rows = [json.loads(line) for line in TRACE_FIXTURE.open()]
         recorded = next(r for r in rows if r["episode_id"] == "ep_000341" and r["step"] == 1)["reward_measurements"]
@@ -300,7 +300,9 @@ class TestTraceLoader:
             _, reward, _, info = backend.step(meta.episode_id, ToolCall(**row["tool_sent"]))
             assert info["guardrail_accepted"] is True
             assert info["cell_capacity_mbps"] == pytest.approx(120.0)
-            assert info["cell_capacity_source"] == "recorded_transition"
+            assert info["cell_capacity_mbps_per_cell"] == pytest.approx(120.0)
+            assert info["cell_capacity_mbps_total"] == pytest.approx(120.0)
+            assert info["cell_capacity_source"] == "recorded_transition_total"
             assert reward == pytest.approx(row["reward"])
         backend.close(meta.episode_id)
 
@@ -405,6 +407,104 @@ class TestTraceLoader:
         ]
         path.write_text("\n".join(json.dumps(item) for item in rows) + "\n")
         with pytest.raises(ValueError, match="finite and positive"):
+            load_provided_dataset(path)
+
+    def test_t1_trace_preserves_topology_initial_history_and_receipts(self, tmp_path):
+        path = tmp_path / "amparo_like.jsonl"
+
+        def row(step: int, action: dict, accepted: bool, delivered: float) -> dict:
+            return {
+                "iter": 0,
+                "episode_id": "amparo",
+                "step": step,
+                "scenario_mode": "t1_runner",
+                "kpi_source": "runner_snapshot",
+                "tool_sent": action,
+                "guardrail_accepted": accepted,
+                "rejected": not accepted,
+                "reward_measurements": {
+                    "aggregate_delivered_mbps": delivered,
+                    "n_ues": 4.0,
+                    "mean_jain_fairness": 0.7264269868637496,
+                    "fairness_deficit": 0.18663647693240693,
+                    "prb_pressure": 0.5466413043478261,
+                    "access_pressure": 0.0,
+                    "buffer_pressure": 0.6207570070635575,
+                    "sla_violations": 1.0,
+                    "cell_capacity_mbps_total": 150.0,
+                },
+            }
+
+        cell0 = {
+            "name": "set_prb_cap",
+            "arguments": {"cell_id": 0, "target": "ue", "target_id": 0, "max_prb": 10},
+        }
+        cell1 = {
+            "name": "set_prb_cap",
+            "arguments": {"cell_id": 1, "target": "ue", "target_id": 1, "max_prb": 10},
+        }
+        rows = [
+            row(0, cell0, True, 22.753),
+            row(1, cell1, True, 8.582),
+            row(2, cell0, False, 8.582),
+            row(3, cell0, True, 8.582),
+        ]
+        path.write_text("\n".join(json.dumps(item) for item in rows) + "\n")
+
+        source = load_provided_dataset(path)["amparo"]
+        first = source.observations[0]
+        assert first.global_.n_cells == 2
+        assert first.global_.n_ues_total == 4
+        assert [len(cell.ues) for cell in first.cells] == [2, 2]
+        assert sum(ue.delivered_mbps for cell in first.cells for ue in cell.ues) == pytest.approx(22.753)
+        assert sum(cell.sla_violations_last_window for cell in first.cells) == 1
+        assert sum(cell.fairness_jain for cell in first.cells) / 2 == pytest.approx(0.7264269868637496)
+        assert sum(max(0.0, 0.8 - cell.fairness_jain) / 0.8 for cell in first.cells) / 2 == pytest.approx(
+            0.18663647693240693
+        )
+
+        backend = _make_backend(
+            dataset_path=str(path),
+            reward_profile="openair_v2_measured",
+            reward_weights={"w_sla": 0.0, "w_sla_level": 0.0, "w_buffer": 0.0, "w_action": 0.0},
+        )
+        _, meta = backend.reset({"scenario_id": "amparo"})
+        reset_receipt = backend.episode_receipt_info(meta.episode_id)
+        assert reset_receipt["reconstruction_schema"] == "aggregate_trace_multicell_proxy_v1"
+        assert reset_receipt["reconstruction_n_cells"] == 2
+        assert reset_receipt["reconstruction_ue_counts"] == [2, 2]
+        assert reset_receipt["dataset_row_count"] == 4
+        assert reset_receipt["dataset_episode_count"] == 1
+        assert reset_receipt["dataset_identity"] == f"sha256:{reset_receipt['dataset_sha256']}"
+
+        observed_acceptance = []
+        for expected in rows[1:]:
+            _, _, _, info = backend.step(meta.episode_id, ToolCall(**expected["tool_sent"]))
+            observed_acceptance.append(info["guardrail_accepted"])
+            assert info["cell_capacity_mbps_per_cell"] == pytest.approx(75.0)
+            assert info["cell_capacity_mbps_total"] == pytest.approx(150.0)
+            assert info["reconstruction_n_cells"] == 2
+        assert observed_acceptance == [True, False, True]
+        backend.close(meta.episode_id)
+
+    def test_accepted_action_conflicting_with_scenario_topology_fails(self, tmp_path):
+        path = tmp_path / "conflict.jsonl"
+        rows = [
+            {
+                "episode_id": "e",
+                "step": step,
+                "scenario_mode": "t1_runner",
+                "tool_sent": {
+                    "name": "set_scheduler_policy",
+                    "arguments": {"cell_id": 2, "policy": "PF"},
+                },
+                "guardrail_accepted": True,
+                "reward_measurements": {"aggregate_delivered_mbps": 10.0, "n_ues": 4},
+            }
+            for step in range(2)
+        ]
+        path.write_text("\n".join(json.dumps(item) for item in rows) + "\n")
+        with pytest.raises(ValueError, match="requires 3 cells.*declares 2"):
             load_provided_dataset(path)
 
 

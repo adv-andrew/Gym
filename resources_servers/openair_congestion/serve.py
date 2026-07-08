@@ -56,6 +56,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-path", default="data/dataset/provided.jsonl")
     parser.add_argument("--cell-capacity-mbps", type=float, default=60.0)
     parser.add_argument(
+        "--observation-render",
+        choices=("verbose_v1", "t2_compact_pipe_v2"),
+        default="t2_compact_pipe_v2",
+        help="Policy observation representation (standalone GRPO defaults to the T2 compact form).",
+    )
+    parser.add_argument(
         "--reward-profile",
         choices=tuple(NAMED_REWARD_PROFILE_OVERRIDES) + ("custom",),
         default="openair_v1",
@@ -96,6 +102,7 @@ def config_from_args(args: argparse.Namespace) -> OpenAirCongestionResourcesServ
         cell_capacity_mbps=args.cell_capacity_mbps,
         reward_profile=args.reward_profile,
         reward_weights=reward_weights or None,
+        observation_render=args.observation_render,
     )
 
 

@@ -55,8 +55,8 @@ from resources_servers.openair_congestion.backends import (
 
 
 # isort: split
-from openair_congestion.render import to_user_text
-from openair_congestion.schemas import ToolCall
+from openair_congestion.render import to_compact_user_text, to_user_text
+from openair_congestion.schemas import AgentAux, LastActionEcho, ToolCall
 
 
 class RewardWeightOverrides(BaseModel):
@@ -101,6 +101,7 @@ class OpenAirCongestionResourcesServerConfig(BaseResourcesServerConfig):
     cell_capacity_mbps: float = Field(default=60.0, gt=0.0, allow_inf_nan=False)
     reward_profile: Literal["openair_v1", "openair_v2_measured", "custom"] = "openair_v1"
     reward_weights: Optional[RewardWeightOverrides] = None
+    observation_render: Literal["verbose_v1", "t2_compact_pipe_v2"] = "verbose_v1"
     # Truncation-budget fallback for task rows that omit max_steps. Must not
     # exceed the gymnasium_agent's max_steps in the yaml: the agent truncates
     # client-side without notifying the env, so a larger server budget would
@@ -121,14 +122,6 @@ class OpenAirCongestionResourcesServerConfig(BaseResourcesServerConfig):
         overrides = self.reward_weights.model_dump(exclude_none=True) if self.reward_weights else None
         validate_reward_profile(self.reward_profile, overrides)
         return self
-
-
-# Returned (with 0.0 reward, env not advanced) when the model's turn contains
-# no tool call.
-_NO_TOOL_CALL_MSG = (
-    "No tool call detected. Issue exactly one tool call per turn from the "
-    "configured action space (use `noop` to stand pat). Telemetry unchanged."
-)
 
 
 class OpenAirCongestionEnv(GymnasiumServer):
@@ -155,11 +148,14 @@ class OpenAirCongestionEnv(GymnasiumServer):
 
     def _backend_receipt_info(self) -> dict[str, Any]:
         return {
-            "backend": self.backend.backend_name,
-            "dynamics_mode": self.backend.dynamics_mode,
-            "action_affects_observation": self.backend.action_affects_observation,
-            "reward_profile": self.backend.reward_profile,
+            **self.backend.receipt_info(),
+            "observation_render": self.config.observation_render,
         }
+
+    def _render_observation(self, observation: Any) -> str:
+        if self.config.observation_render == "t2_compact_pipe_v2":
+            return to_compact_user_text(observation)
+        return to_user_text(observation)
 
     def setup_webserver(self) -> FastAPI:
         app = super().setup_webserver()
@@ -242,7 +238,11 @@ class OpenAirCongestionEnv(GymnasiumServer):
             "max_steps": meta.max_steps,
         }
         reset_info.update(self._backend_receipt_info())
-        return to_user_text(first_obs), reset_info
+        reset_info.update(self.backend.episode_receipt_info(meta.episode_id))
+        # App-level render selection is authoritative if a backend receipt ever
+        # grows an identically named field.
+        reset_info["observation_render"] = self.config.observation_render
+        return self._render_observation(first_obs), reset_info
 
     async def step(
         self, action: NeMoGymResponse, metadata: dict, session_id: Optional[str] = None
@@ -258,47 +258,46 @@ class OpenAirCongestionEnv(GymnasiumServer):
         out_of_budget = state["agent_steps"] >= state["max_agent_steps"]
 
         calls = [item for item in action.output if getattr(item, "type", None) == "function_call"]
+        call: Optional[NeMoGymResponseFunctionToolCall] = None
+        tool_outputs: list[dict[str, Any]] = []
+        protocol_error: Optional[str] = None
+        protocol_error_detail: Optional[str] = None
 
-        # No tool call this turn: 0.0 reward, env not stepped, nudge the model.
-        if not calls:
-            info = {"error": "no_tool_call", "tool_outputs": []}
-            info.update(self._backend_receipt_info())
-            return (
-                None if out_of_budget else _NO_TOOL_CALL_MSG,
-                0.0,
-                False,
-                out_of_budget,
-                info,
+        # A malformed model turn still consumes one recorded/synthetic
+        # transition and earns the backend's guardrail rejection penalty. This
+        # prevents the policy from skipping predominantly-negative KPI steps by
+        # emitting text, invalid JSON, or multiple calls. The surrogate action
+        # is guaranteed to fail the shared guardrail before any actuator effect.
+        if len(calls) != 1:
+            protocol_error = "no_tool_call" if not calls else "multiple_tool_calls"
+            protocol_error_detail = (
+                "exactly one tool call is required" if calls else "no tool call detected; exactly one is required"
             )
-
-        # Exactly one tool call per turn: apply the first, answer extras with
-        # an error output so every function_call still gets a matching
-        # function_call_output in the conversation.
-        call: NeMoGymResponseFunctionToolCall = calls[0]
-        tool_outputs = [
-            self.tool_output(extra, {"error": "one tool call per turn; only the first was applied"})
-            for extra in calls[1:]
-        ]
-
-        # Normalise to the env's ToolCall. Unknown tool name / malformed JSON
-        # arguments are rejected gracefully (0.0 reward, env not stepped);
-        # pydantic ValidationError subclasses ValueError, as does JSONDecodeError.
-        try:
-            raw_args = json.loads(call.arguments) if (call.arguments or "").strip() else {}
-            if not isinstance(raw_args, dict):
-                raise ValueError(f"arguments must be a JSON object, got {type(raw_args).__name__}")
-            tool_call = ToolCall(name=call.name, arguments=raw_args)
-        except ValueError as exc:
-            tool_outputs.insert(0, self.tool_output(call, {"accepted": False, "error": str(exc)}))
-            info = {"error": "invalid_tool_call", "tool_outputs": tool_outputs}
-            info.update(self._backend_receipt_info())
-            return (
-                None if out_of_budget else "Invalid tool call rejected; telemetry unchanged.",
-                0.0,
-                False,
-                out_of_budget,
-                info,
-            )
+            tool_outputs = [
+                self.tool_output(
+                    extra,
+                    {"accepted": False, "error": protocol_error_detail},
+                )
+                for extra in calls
+            ]
+            tool_call = ToolCall(name="set_scheduler_policy", arguments={})
+        else:
+            call = calls[0]
+            try:
+                raw_args = json.loads(call.arguments) if (call.arguments or "").strip() else {}
+                if not isinstance(raw_args, dict):
+                    raise ValueError(f"arguments must be a JSON object, got {type(raw_args).__name__}")
+                tool_call = ToolCall(name=call.name, arguments=raw_args)
+            except ValueError as exc:
+                protocol_error = "invalid_tool_call"
+                protocol_error_detail = str(exc)
+                tool_outputs = [
+                    self.tool_output(
+                        call,
+                        {"accepted": False, "error": protocol_error_detail},
+                    )
+                ]
+                tool_call = ToolCall(name="set_scheduler_policy", arguments={})
 
         # One env step. In-range-but-rejected actions (guardrail) come back as
         # accepted=False with the env's own penalty reward, never an exception.
@@ -312,17 +311,40 @@ class OpenAirCongestionEnv(GymnasiumServer):
         accepted = bool(step_info.get("guardrail_accepted", True))
         rejection_reason = step_info.get("rejection_reason")
         step_idx = step_info.get("step_idx", state["n_steps"])
-        tool_outputs.insert(
-            0,
-            self.tool_output(
-                call,
-                {"accepted": accepted, "rejection_reason": rejection_reason, "step_idx": step_idx},
-            ),
-        )
+        if protocol_error is not None:
+            if accepted:
+                raise RuntimeError("protocol-rejection surrogate unexpectedly passed the guardrail")
+            accepted = False
+            rejection_reason = protocol_error_detail
+            next_obs = next_obs.model_copy(
+                update={
+                    "agent_aux": AgentAux(
+                        last_action=LastActionEcho(
+                            name=protocol_error,
+                            arguments={},
+                        ),
+                        last_reward=float(reward),
+                        last_rejection=rejection_reason,
+                        step_idx=int(step_idx),
+                    )
+                }
+            )
+        else:
+            assert call is not None
+            tool_outputs.append(
+                self.tool_output(
+                    call,
+                    {
+                        "accepted": accepted,
+                        "rejection_reason": rejection_reason,
+                        "step_idx": step_idx,
+                    },
+                )
+            )
 
         terminated = bool(done)
         truncated = (not terminated) and out_of_budget
-        observation = None if (terminated or truncated) else to_user_text(next_obs)
+        observation = None if (terminated or truncated) else self._render_observation(next_obs)
 
         response_info = dict(step_info)
         response_info.update(
@@ -337,6 +359,13 @@ class OpenAirCongestionEnv(GymnasiumServer):
             }
         )
         response_info.update(self._backend_receipt_info())
+        if protocol_error is not None:
+            response_info.update(
+                {
+                    "error": protocol_error,
+                    "protocol_rejection": True,
+                }
+            )
 
         return (
             observation,

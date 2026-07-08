@@ -82,14 +82,17 @@ One JSON object per RL step, as emitted by GRPO training runs. Only the observat
 
 | Column | Required | Read as |
 |--------|----------|---------|
-| `reward_measurements` | yes | Aggregate KPI state (the dict `rewards.compute_breakdown` emits), reconstructed into a single-cell observation. `aggregate_delivered_mbps` and `n_ues` are required; the other read keys -- `mean_jain_fairness`, `sla_violations`, `prb_pressure`, `access_pressure`, `buffer_pressure`, `requested_service_mbps` -- default to their uncongested values when absent |
+| `reward_measurements` | yes | Aggregate KPI state (the dict `rewards.compute_breakdown` emits), distributed over the inferred runner topology. `aggregate_delivered_mbps` and `n_ues` are required; the other read keys -- `mean_jain_fairness`, `sla_violations`, `prb_pressure`, `access_pressure`, `buffer_pressure`, `requested_service_mbps` -- default to their uncongested values when absent |
 | `reward_measurements.cell_capacity_mbps_total` | no | Keeps that transition's reward normalizer at the recorded scale; absent on a row, the configured `cell_capacity_mbps` applies to the transition ending at that row |
 | `episode_id` | no | Episode grouping; if a merged trace reuses an ID across `iter` values, keys become `iter_N::episode_id` so iterations cannot interleave |
 | `step` | no | Ordering within an episode; falls back to `t_s`, then file order |
 | `iter` | no | GRPO iteration identity; used to disambiguate repeated episode IDs |
+| `scenario_mode` | no | Known runner topology (`t1_runner` = 2 cells, `t2_runner` = 3); validated against accepted recorded action targets |
 | `kpi_source` | no | Provenance stamp (default `replay`) |
 
-Everything else a trace row carries -- `tool_sent`, `reward`, `reward_terms`, `rejected`, `guardrail_accepted`, `rejection_reason`, `seed`, `scenario_mode`, `group_id`, `episode_return`, `episode_advantage`, `raw_text`, `actuator` -- is not replayed as policy behavior: actions come from the policy being trained, and rewards and guardrail outcomes are recomputed over reconstructed observation pairs. (`tool_sent` still selects the trace parser.) The listed aggregate fields are reconstructed, but per-UE service accounting, 5QI mix, and buffer distribution cannot be recovered from aggregates. Reward equivalence therefore requires a compatible trace schema and the exact recorded reward profile; it is not guaranteed for richer reward versions.
+Actions during replay come from the policy being trained. Recorded accepted `tool_sent` metadata is used only to infer/validate cell topology, and row 0's accepted action seeds the logical guardrail history because row 0 is already a post-action snapshot. Aggregate throughput, UE/SLA counts, pressure, mean fairness, and fairness-deficit measurements are distributed deterministically across the inferred cells; local UE IDs restart at zero in each cell. This is a versioned reconstructed proxy (`aggregate_trace_multicell_proxy_v1`), not recovery of the original nested observation: per-UE service accounting, 5QI mix, radio fields, and buffer distribution are unavailable. Reward equivalence is therefore not guaranteed for richer reward versions, and Run A absolute returns must not be compared with the source trace's returns.
+
+A trace with **N action/reward rows yields N-1 replay transitions** because it does not contain the observation that preceded row 0. Row 0 becomes the initial observation and its accepted action becomes initial guardrail history; its recorded reward is not replayed.
 
 ### Replaying a provided dataset
 
@@ -136,10 +139,15 @@ python -m resources_servers.openair_congestion.serve \
   --backend dataset_replay \
   --dataset-path /absolute/path/to/train.jsonl \
   --reward-profile openair_v2_measured \
+  --observation-render t2_compact_pipe_v2 \
   --max-steps 12 --pool-size 64 --port 9110
 ```
 
-Use `--backend replay --port 9111` for an action-responsive synthetic comparison. The `/reset` and `/step` responses expose `backend`, `dynamics_mode`, `action_affects_observation`, and `reward_profile`; dataset steps additionally expose effective weights, transition capacity/source, and dataset key/index for receipts.
+Use `--backend replay --port 9111` for an action-responsive synthetic comparison. `verbose_v1` and `t2_compact_pipe_v2` are explicit observation-render choices; the standalone launcher defaults to the compact form while the catalog YAML retains the verbose form. The `/reset` and `/step` responses expose backend/dynamics semantics, the selected render, effective reward weights, and (for datasets) SHA-256 identity, row/episode counts, reconstruction schema/topology/assumptions, transition capacity, and dataset key/index.
+
+Malformed, missing, or multiple tool calls consume one transition and receive the backend's ordinary guardrail-rejection penalty. This closes the shortcut where a policy could skip a negative recorded KPI transition by emitting no valid call.
+
+For `dataset_replay`, report return improvement only together with parse-invalid, rejection, noop, and accepted-nonnoop rates. A falling rejection rate demonstrates learning this reconstructed server's tool-validity contract; it does **not** demonstrate that actions improved recorded KPIs. The action-responsive `replay` backend is the separate decision-learning experiment.
 
 ### Scripted client demo
 

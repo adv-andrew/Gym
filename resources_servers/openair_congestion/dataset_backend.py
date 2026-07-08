@@ -29,8 +29,8 @@ the README for the column contract of each):
   dataset still yields the stable training shape.
 - GRPO rollout traces: one row per policy step carrying a
   ``reward_measurements`` dict (the aggregates emitted by
-  ``rewards.compute_breakdown``). Each trace row is reconstructed into a
-  single-cell observation whose aggregate KPIs — delivered throughput, mean
+  ``rewards.compute_breakdown``). Each trace row is reconstructed over an
+  inferred multi-cell topology whose aggregate KPIs — delivered throughput, mean
   Jain fairness, PRB/access/buffer pressure, SLA violation count — reproduce
   the recorded measurements, and a recorded ``cell_capacity_mbps_total``
   keeps each transition's reward normalizer at the recorded scale. Per-UE
@@ -48,6 +48,7 @@ reward is computed over the served observation pair via the unchanged
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 import threading
@@ -77,8 +78,141 @@ from openair_congestion.schemas import (
 # rollouts apart from ReplayEnv's synthetic action-effect model.
 DATASET_DYNAMICS_MODE = "provided_data_passthrough_v1"
 
+# Aggregate-only GRPO traces do not carry the original nested observation.
+# This versioned label makes that lossy reconstruction explicit in receipts.
+TRACE_RECONSTRUCTION_SCHEMA = "aggregate_trace_multicell_proxy_v1"
+NATIVE_SNAPSHOT_SCHEMA = "native_snapshot_v1"
+
+# Known runner layouts. Accepted action metadata is the primary topology
+# evidence; this mapping validates it and supplies a deterministic fallback for
+# episodes whose recorded policy happened not to address every cell.
+_SCENARIO_N_CELLS = {
+    "t1_runner": 2,
+    "t2_runner": 3,
+}
+
 # Schema bound on total UEs per observation (tools.MAX_UES).
 _MAX_UES = 24
+
+
+@dataclass(frozen=True)
+class TraceTopology:
+    """Auditable topology inferred for one aggregate trace episode."""
+
+    n_cells: int
+    scenario_mode: Optional[str]
+    source: str
+
+
+def _recorded_action_accepted(row: dict[str, Any]) -> Optional[bool]:
+    accepted = row.get("guardrail_accepted")
+    if accepted is not None:
+        if not isinstance(accepted, bool):
+            raise ValueError(f"guardrail_accepted must be bool, got {accepted!r}")
+        return accepted
+    rejected = row.get("rejected")
+    if rejected is not None:
+        if not isinstance(rejected, bool):
+            raise ValueError(f"rejected must be bool, got {rejected!r}")
+        return not rejected
+    return None
+
+
+def _recorded_tool_call(row: dict[str, Any]) -> Optional[ToolCall]:
+    raw = row.get("tool_sent")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"tool_sent must be an object, got {type(raw).__name__}")
+    return ToolCall.model_validate(raw)
+
+
+def _trace_n_ues(row: dict[str, Any]) -> int:
+    measurements = row.get("reward_measurements")
+    if not isinstance(measurements, dict) or "n_ues" not in measurements:
+        raise ValueError("trace row reward_measurements is missing required key 'n_ues'")
+    value = measurements["n_ues"]
+    if isinstance(value, bool):
+        raise ValueError(f"reward_measurements.n_ues must be an integer, got {value!r}")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"reward_measurements.n_ues must be an integer, got {value!r}") from exc
+    if not math.isfinite(numeric) or not numeric.is_integer() or numeric <= 0 or numeric > _MAX_UES:
+        raise ValueError(f"reward_measurements.n_ues must be an integer in [1,{_MAX_UES}], got {value!r}")
+    return int(numeric)
+
+
+def _ue_counts(n_ues: int, n_cells: int) -> tuple[int, ...]:
+    if n_ues < n_cells:
+        raise ValueError(f"cannot reconstruct {n_cells} non-empty cells from only {n_ues} aggregate UEs")
+    quotient, remainder = divmod(n_ues, n_cells)
+    return tuple(quotient + (1 if cell_id < remainder else 0) for cell_id in range(n_cells))
+
+
+def _infer_trace_topology(rows: list[dict[str, Any]]) -> TraceTopology:
+    """Infer topology from accepted actions, checked against runner metadata."""
+    scenario_modes = {
+        str(row["scenario_mode"]).strip().lower() for row in rows if row.get("scenario_mode") not in (None, "")
+    }
+    if len(scenario_modes) > 1:
+        raise ValueError(f"trace episode has conflicting scenario_mode values: {sorted(scenario_modes)}")
+    scenario_mode = next(iter(scenario_modes), None)
+    mapped_n_cells = _SCENARIO_N_CELLS.get(scenario_mode or "")
+
+    max_accepted_cell_id = -1
+    parsed_actions: list[tuple[dict[str, Any], Optional[ToolCall], Optional[bool]]] = []
+    for row in rows:
+        action = _recorded_tool_call(row)
+        accepted = _recorded_action_accepted(row)
+        parsed_actions.append((row, action, accepted))
+        if not accepted or action is None or action.name == "noop":
+            continue
+        cell_id = action.arguments.get("cell_id")
+        if isinstance(cell_id, bool) or not isinstance(cell_id, int) or cell_id < 0:
+            raise ValueError(f"accepted recorded action has invalid cell_id={cell_id!r}")
+        max_accepted_cell_id = max(max_accepted_cell_id, cell_id)
+
+    action_n_cells = max_accepted_cell_id + 1 if max_accepted_cell_id >= 0 else None
+    if mapped_n_cells is not None and action_n_cells is not None and action_n_cells > mapped_n_cells:
+        raise ValueError(
+            f"accepted action metadata requires {action_n_cells} cells but "
+            f"scenario_mode={scenario_mode!r} declares {mapped_n_cells}"
+        )
+    n_cells = mapped_n_cells or action_n_cells or 1
+    source_parts = []
+    if action_n_cells is not None:
+        source_parts.append("accepted_tool_metadata")
+    if mapped_n_cells is not None:
+        source_parts.append(f"scenario_mode:{scenario_mode}")
+    if not source_parts:
+        source_parts.append("single_cell_fallback")
+
+    # Validate every accepted UE target against the deterministic per-row
+    # distribution. Rejected actions are intentionally not topology evidence.
+    for row, action, accepted in parsed_actions:
+        counts = _ue_counts(_trace_n_ues(row), n_cells)
+        if not accepted or action is None or action.name != "set_prb_cap":
+            continue
+        args = action.arguments
+        cell_id = args.get("cell_id")
+        if not isinstance(cell_id, int) or isinstance(cell_id, bool) or not 0 <= cell_id < n_cells:
+            raise ValueError(
+                f"accepted set_prb_cap cell_id={cell_id!r} conflicts with inferred {n_cells}-cell topology"
+            )
+        if args.get("target") == "ue":
+            target_id = args.get("target_id")
+            if not isinstance(target_id, int) or isinstance(target_id, bool) or not 0 <= target_id < counts[cell_id]:
+                raise ValueError(
+                    f"accepted set_prb_cap target_id={target_id!r} conflicts with "
+                    f"cell {cell_id} UE count {counts[cell_id]}"
+                )
+
+    return TraceTopology(
+        n_cells=n_cells,
+        scenario_mode=scenario_mode,
+        source="+".join(source_parts),
+    )
 
 
 # --- KPI-snapshot rows -> Observation ----------------------------------------
@@ -233,7 +367,58 @@ def is_trace_row(row: dict[str, Any]) -> bool:
     return "tool_sent" in row or "reward_measurements" in row
 
 
-def trace_row_to_snapshot(row: dict[str, Any]) -> dict[str, Any]:
+def _fairness_by_cell(measurements: dict[str, Any], n_cells: int) -> tuple[float, ...]:
+    """Reconstruct cell fairness while preserving mean and deficit aggregates."""
+    mean = _num(measurements, "mean_jain_fairness", 1.0)
+    if not math.isfinite(mean) or not 0.0 <= mean <= 1.0:
+        raise ValueError(f"mean_jain_fairness must be finite and in [0,1], got {mean!r}")
+    raw_deficit = measurements.get("fairness_deficit")
+    if raw_deficit is None:
+        return (mean,) * n_cells
+    deficit = float(raw_deficit)
+    if not math.isfinite(deficit) or not 0.0 <= deficit <= 1.0:
+        raise ValueError(f"fairness_deficit must be finite and in [0,1], got {raw_deficit!r}")
+
+    target = 0.8
+    total_fairness = n_cells * mean
+    total_shortfall = n_cells * target * deficit
+    tolerance = 1e-8
+    for below_count in range(n_cells + 1):
+        above_count = n_cells - below_count
+        below_sum = below_count * target - total_shortfall
+        above_sum = total_fairness - below_sum
+        if below_count == 0:
+            if abs(below_sum) > tolerance:
+                continue
+            below_values: list[float] = []
+        elif not -tolerance <= below_sum <= below_count * target + tolerance:
+            continue
+        else:
+            below_values = [min(target, max(0.0, below_sum / below_count))] * below_count
+        if above_count == 0:
+            if abs(above_sum) > tolerance:
+                continue
+            above_values: list[float] = []
+        elif not above_count * target - tolerance <= above_sum <= above_count + tolerance:
+            continue
+        else:
+            above_values = [min(1.0, max(target, above_sum / above_count))] * above_count
+        values = tuple(below_values + above_values)
+        rebuilt_mean = sum(values) / n_cells
+        rebuilt_deficit = sum(max(0.0, target - value) / target for value in values) / n_cells
+        if abs(rebuilt_mean - mean) <= 1e-7 and abs(rebuilt_deficit - deficit) <= 1e-7:
+            return values
+    raise ValueError(
+        "mean_jain_fairness and fairness_deficit cannot be represented by "
+        f"{n_cells} reconstructed cells: mean={mean}, deficit={deficit}"
+    )
+
+
+def trace_row_to_snapshot(
+    row: dict[str, Any],
+    *,
+    topology: Optional[TraceTopology] = None,
+) -> dict[str, Any]:
     """Rebuild one GRPO trace row into the nested KPI-snapshot row shape.
 
     Reads only the aggregates that ``rewards.compute_breakdown`` emits into
@@ -245,13 +430,13 @@ def trace_row_to_snapshot(row: dict[str, Any]) -> dict[str, Any]:
         access_pressure -> prach_collision_rate = 0.05 + 0.45 * pressure
         buffer_pressure -> buffer_occupancy_kb  = (pressure + 0.7) * 1024 (if > 0)
 
-    The result is one cell with ``n_ues`` identical UEs; re-running
+    The result distributes ``n_ues`` over an inferred runner topology; re-running
     ``compute_breakdown`` over reconstructed pairs reproduces the recorded
     aggregate measurements, but per-UE detail (elastic Jain fairness, the
     real buffer distribution) is lost. A recorded ``cell_capacity_mbps_total``
     is carried through so the reward's throughput normalizer keeps the
-    recorded scale (the reconstruction is single-cell, so the total is the
-    per-cell value ``compute_breakdown`` expects).
+    recorded scale. The backend converts that total to the per-cell value
+    ``compute_breakdown`` expects after topology reconstruction.
     """
     measurements = row.get("reward_measurements")
     if not isinstance(measurements, dict):
@@ -262,7 +447,11 @@ def trace_row_to_snapshot(row: dict[str, Any]) -> dict[str, Any]:
                 f"trace row reward_measurements is missing required key {key!r}; got keys {sorted(measurements)}"
             )
 
-    n_ues = max(1, min(_MAX_UES, int(_num(measurements, "n_ues", 1))))
+    if topology is None:
+        topology = _infer_trace_topology([row])
+    n_cells = topology.n_cells
+    n_ues = _trace_n_ues(row)
+    ue_counts = _ue_counts(n_ues, n_cells)
     delivered_total = max(0.0, _num(measurements, "aggregate_delivered_mbps", 0.0))
     delivered = delivered_total / n_ues
     offered = max(delivered, _num(measurements, "requested_service_mbps", delivered * n_ues) / n_ues)
@@ -277,21 +466,37 @@ def trace_row_to_snapshot(row: dict[str, Any]) -> dict[str, Any]:
     buffer_pressure = max(0.0, _num(measurements, "buffer_pressure", 0.0))
     buffer_kb = (buffer_pressure + 0.7) * 1024.0 if buffer_pressure > 0.0 else 0.0
 
-    fairness = min(1.0, max(0.0, _num(measurements, "mean_jain_fairness", 1.0)))
+    fairness_by_cell = _fairness_by_cell(measurements, n_cells)
     sla = max(0, int(round(_num(measurements, "sla_violations", 0.0))))
+    sla_quotient, sla_remainder = divmod(sla, n_cells)
+    sla_by_cell = tuple(sla_quotient + (1 if cell_id < sla_remainder else 0) for cell_id in range(n_cells))
 
-    ues = [
-        {
-            "ue_id": i,
-            "offered_mbps": offered,
-            "delivered_mbps": delivered,
-            "buffer_occupancy_kb": buffer_kb,
-            # Per-UE PDB flags are aggregate bookkeeping: the first `sla` UEs
-            # carry the violation so cell and UE counts stay consistent.
-            "pdb_violations": 1 if i < sla else 0,
-        }
-        for i in range(n_ues)
-    ]
+    cells = []
+    for cell_id, (cell_n_ues, cell_fairness, cell_sla) in enumerate(zip(ue_counts, fairness_by_cell, sla_by_cell)):
+        ues = [
+            {
+                # UE ids are local to each reconstructed cell. For Amparo's
+                # t1_runner trace this yields cells 0/1 with local ids 0/1.
+                "ue_id": ue_id,
+                "offered_mbps": offered,
+                "delivered_mbps": delivered,
+                "buffer_occupancy_kb": buffer_kb,
+                "pdb_violations": 1 if ue_id < min(cell_sla, cell_n_ues) else 0,
+            }
+            for ue_id in range(cell_n_ues)
+        ]
+        cells.append(
+            {
+                "cell_id": cell_id,
+                "prb_util_dl_p50": p50,
+                "prb_util_dl_p99": p99,
+                "prach_collision_rate": prach,
+                "rrc_connected_ues": cell_n_ues,
+                "fairness_jain": cell_fairness,
+                "sla_violations_last_window": cell_sla,
+                "ues": ues,
+            }
+        )
     snapshot: dict[str, Any] = {
         "episode_id": row.get("episode_id"),
         "step": row.get("step"),
@@ -299,20 +504,16 @@ def trace_row_to_snapshot(row: dict[str, Any]) -> dict[str, Any]:
         # is not part of Observation, but it prevents repeated episode IDs
         # from different iterations being silently interleaved.
         "_source_iter": row.get("iter"),
+        "_source_tool_sent": row.get("tool_sent"),
+        "_source_action_accepted": _recorded_action_accepted(row),
+        "_source_scenario_mode": topology.scenario_mode,
+        "_reconstruction_schema": TRACE_RECONSTRUCTION_SCHEMA,
+        "_reconstruction_topology_source": topology.source,
+        "_reconstruction_n_cells": n_cells,
+        "_reconstruction_ue_counts": list(ue_counts),
         "kpi_source_mode": str(row.get("kpi_source", "replay")),
         "cell_capacity_mbps_total": measurements.get("cell_capacity_mbps_total"),
-        "cells": [
-            {
-                "cell_id": 0,
-                "prb_util_dl_p50": p50,
-                "prb_util_dl_p99": p99,
-                "prach_collision_rate": prach,
-                "rrc_connected_ues": n_ues,
-                "fairness_jain": fairness,
-                "sla_violations_last_window": sla,
-                "ues": ues,
-            }
-        ],
+        "cells": cells,
         "_lineno": row.get("_lineno", "?"),
     }
     return snapshot
@@ -387,6 +588,11 @@ class EpisodeSource:
     # transition ending at that row, so step(prev=i, curr=i+1) consumes entry
     # i+1. None means the backend's configured default applies for that step.
     cell_capacity_mbps_by_observation: tuple[Optional[float], ...]
+    reconstruction_schema: str = NATIVE_SNAPSHOT_SCHEMA
+    reconstruction_topology_source: str = "native_dataset_rows"
+    source_scenario_mode: Optional[str] = None
+    initial_history_action: Optional[ToolCall] = None
+    initial_history_action_accepted: bool = False
 
 
 def _order_value(path: Path, row: dict[str, Any], key: str) -> float:
@@ -397,7 +603,7 @@ def _order_value(path: Path, row: dict[str, Any], key: str) -> float:
 
 
 def _source_iteration(path: Path, row: dict[str, Any]) -> Optional[int]:
-    value = row.get("_source_iter")
+    value = row.get("_source_iter", row.get("iter"))
     if value is None:
         return None
     if isinstance(value, bool):
@@ -451,11 +657,29 @@ def load_provided_dataset(path: str | Path) -> dict[str, EpisodeSource]:
             "(preferred) or .csv (adapter in _rows_from_csv)"
         )
 
-    if rows and is_trace_row(rows[0]):
+    trace_format = bool(rows and is_trace_row(rows[0]))
+    if trace_format:
+        # Infer topology per source episode before flattening rows into the
+        # snapshot representation. Iteration is part of the identity so merged
+        # traces cannot lend topology evidence across independent episodes.
+        trace_groups: dict[tuple[str, Optional[int]], list[dict[str, Any]]] = {}
+        for row in rows:
+            base_key = str(row.get("episode_id") or row.get("episode") or "episode_0")
+            identity = (base_key, _source_iteration(path, row))
+            trace_groups.setdefault(identity, []).append(row)
+        topologies: dict[tuple[str, Optional[int]], TraceTopology] = {}
+        for identity, group in trace_groups.items():
+            try:
+                topologies[identity] = _infer_trace_topology(group)
+            except (TypeError, ValueError) as exc:
+                first = group[0]
+                raise ValueError(f"{path}:{first.get('_lineno', '?')} (trace episode {identity!r}): {exc}") from exc
         converted = []
         for row in rows:
+            base_key = str(row.get("episode_id") or row.get("episode") or "episode_0")
+            identity = (base_key, _source_iteration(path, row))
             try:
-                converted.append(trace_row_to_snapshot(row))
+                converted.append(trace_row_to_snapshot(row, topology=topologies[identity]))
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"{path}:{row.get('_lineno', '?')}: {exc}") from exc
         rows = converted
@@ -516,9 +740,26 @@ def load_provided_dataset(path: str | Path) -> dict[str, EpisodeSource]:
                 "observations per episode (each step consumes an obs pair)"
             )
         capacities = tuple(_capacity_value(path, row) for row in group)
+        first_row = group[0]
+        initial_action = None
+        initial_action_accepted = False
+        if trace_format:
+            raw_initial_action = first_row.get("_source_tool_sent")
+            if raw_initial_action is not None:
+                initial_action = ToolCall.model_validate(raw_initial_action)
+            initial_action_accepted = bool(first_row.get("_source_action_accepted"))
         episodes[key] = EpisodeSource(
             observations=obs_list,
             cell_capacity_mbps_by_observation=capacities,
+            reconstruction_schema=str(first_row.get("_reconstruction_schema", NATIVE_SNAPSHOT_SCHEMA)),
+            reconstruction_topology_source=str(
+                first_row.get("_reconstruction_topology_source", "native_dataset_rows")
+            ),
+            source_scenario_mode=(
+                str(first_row["_source_scenario_mode"]) if first_row.get("_source_scenario_mode") is not None else None
+            ),
+            initial_history_action=initial_action,
+            initial_history_action_accepted=initial_action_accepted,
         )
     if not episodes:
         raise ValueError(f"dataset file {path} contains no rows")
@@ -538,6 +779,9 @@ class DatasetEpisode:
     cell_capacity_mbps_by_observation: tuple[Optional[float], ...]
     source_key: str
     source_index: int
+    reconstruction_schema: str
+    reconstruction_topology_source: str
+    source_scenario_mode: Optional[str]
     step_idx: int = 0
     closed: bool = False
     history: list[Any] = field(default_factory=list)  # guardrail.HistoryEntry
@@ -604,9 +848,58 @@ class DatasetReplayBackend(Backend):
         # episodes; per-episode copies get their own episode_id stamps).
         self._sources: dict[str, EpisodeSource] = load_provided_dataset(self.dataset_path)
         self._keys: list[str] = sorted(self._sources)
+        digest = hashlib.sha256()
+        with self.dataset_path.open("rb") as source_file:
+            for chunk in iter(lambda: source_file.read(1024 * 1024), b""):
+                digest.update(chunk)
+        self.dataset_sha256 = digest.hexdigest()
+        self.dataset_identity = f"sha256:{self.dataset_sha256}"
+        self.dataset_row_count = sum(len(source.observations) for source in self._sources.values())
+        self.dataset_episode_count = len(self._sources)
 
         self._lock = threading.Lock()
         self._episodes: dict[str, DatasetEpisode] = {}
+
+    def receipt_info(self) -> dict[str, Any]:
+        return {
+            **super().receipt_info(),
+            "reward_weights": dict(self.reward_weights_dict),
+            "dataset_identity": self.dataset_identity,
+            "dataset_sha256": self.dataset_sha256,
+            "dataset_row_count": self.dataset_row_count,
+            "dataset_episode_count": self.dataset_episode_count,
+        }
+
+    @staticmethod
+    def _reconstruction_receipt(episode: DatasetEpisode, observation: Observation) -> dict[str, Any]:
+        return {
+            "reconstruction_schema": episode.reconstruction_schema,
+            "reconstruction_topology_source": episode.reconstruction_topology_source,
+            "reconstruction_n_cells": observation.global_.n_cells,
+            "reconstruction_ue_counts": [len(cell.ues) for cell in observation.cells],
+            "reconstruction_source_scenario_mode": episode.source_scenario_mode,
+            "reconstruction_assumptions": (
+                [
+                    "aggregate_kpis_distributed_across_inferred_cells",
+                    "per_ue_radio_and_service_detail_not_recoverable",
+                    "recorded_actions_do_not_drive_replayed_observations",
+                ]
+                if episode.reconstruction_schema == TRACE_RECONSTRUCTION_SCHEMA
+                else []
+            ),
+        }
+
+    def episode_receipt_info(self, episode_id: str) -> dict[str, Any]:
+        with self._lock:
+            episode = self._episodes.get(episode_id)
+        if episode is None:
+            raise KeyError(f"unknown episode_id {episode_id!r}")
+        return {
+            **self.receipt_info(),
+            "dataset_episode_key": episode.source_key,
+            "dataset_index": episode.source_index,
+            **self._reconstruction_receipt(episode, episode.trajectory[episode.step_idx]),
+        }
 
     # --- episode selection ----------------------------------------------------
 
@@ -691,7 +984,21 @@ class DatasetReplayBackend(Backend):
                 cell_capacity_mbps_by_observation=source.cell_capacity_mbps_by_observation,
                 source_key=key,
                 source_index=source_index,
+                reconstruction_schema=source.reconstruction_schema,
+                reconstruction_topology_source=source.reconstruction_topology_source,
+                source_scenario_mode=source.source_scenario_mode,
             )
+            if source.initial_history_action is not None and source.initial_history_action_accepted:
+                # Trace row 0 is already a post-action observation. Preserve
+                # that accepted action at logical t=0 so the first replayed
+                # turn (row 0 -> row 1, logical t=1) sees the same rate-limit
+                # history as the recorded episode.
+                episode.history.append(
+                    _guardrail.HistoryEntry(
+                        action=source.initial_history_action,
+                        t_s=0.0,
+                    )
+                )
             self._episodes[episode_id] = episode
         return first_obs, meta
 
@@ -705,7 +1012,7 @@ class DatasetReplayBackend(Backend):
                 raise RuntimeError(f"episode {episode_id!r} is closed")
 
             prev_obs = episode.trajectory[episode.step_idx]
-            logical_now_s = float(episode.step_idx)
+            logical_now_s = float(episode.step_idx + 1)
 
             # Same guardrail as ReplayEnv.step, fed from the observation
             # itself (a recorded dataset has no scenario fingerprint).
@@ -726,14 +1033,21 @@ class DatasetReplayBackend(Backend):
 
             # A trace row records the normalizer for the transition ending at
             # that observation. Missing values use the configured fallback.
-            recorded_capacity = episode.cell_capacity_mbps_by_observation[next_idx]
-            capacity = recorded_capacity if recorded_capacity is not None else self.cell_capacity_mbps
+            recorded_capacity_total = episode.cell_capacity_mbps_by_observation[next_idx]
+            n_cells = max(1, new_obs.global_.n_cells)
+            # compute_breakdown multiplies its per-cell normalizer by n_cells.
+            # Trace rows record the aggregate total, so divide before passing it
+            # through. A configured fallback remains explicitly per-cell.
+            capacity_per_cell = (
+                recorded_capacity_total / n_cells if recorded_capacity_total is not None else self.cell_capacity_mbps
+            )
+            capacity_total = capacity_per_cell * n_cells
             reward_breakdown = _rewards.compute_breakdown(
                 prev_obs=prev_obs,
                 curr_obs=new_obs,
                 action=tool_call,
                 rejected=rejected,
-                cell_capacity_mbps=capacity,
+                cell_capacity_mbps=capacity_per_cell,
                 weights=self.reward_weights,
             )
             reward = float(reward_breakdown["total"])
@@ -770,12 +1084,23 @@ class DatasetReplayBackend(Backend):
                 "action_affects_observation": False,
                 "reward_profile": self.reward_profile,
                 "reward_weights": dict(self.reward_weights_dict),
-                "cell_capacity_mbps": capacity,
+                # Backward-compatible field now explicitly means the effective
+                # per-cell value passed to compute_breakdown.
+                "cell_capacity_mbps": capacity_per_cell,
+                "cell_capacity_mbps_per_cell": capacity_per_cell,
+                "cell_capacity_mbps_total": capacity_total,
                 "cell_capacity_source": (
-                    "recorded_transition" if recorded_capacity is not None else "configured_default"
+                    "recorded_transition_total"
+                    if recorded_capacity_total is not None
+                    else "configured_per_cell_default"
                 ),
                 "dataset_episode_key": episode.source_key,
                 "dataset_index": episode.source_index,
+                "dataset_identity": self.dataset_identity,
+                "dataset_sha256": self.dataset_sha256,
+                "dataset_row_count": self.dataset_row_count,
+                "dataset_episode_count": self.dataset_episode_count,
+                **self._reconstruction_receipt(episode, new_obs),
                 "reward_measurements": reward_breakdown["measurements"],
                 "reward_terms": reward_breakdown["terms"],
             }

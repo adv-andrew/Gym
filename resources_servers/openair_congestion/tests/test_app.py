@@ -100,6 +100,19 @@ def _tool_response(name: str, arguments: dict) -> NeMoGymResponse:
     )
 
 
+def _multi_tool_response() -> NeMoGymResponse:
+    first = _tool_response("noop", {}).output[0]
+    second = NeMoGymResponseFunctionToolCall(
+        arguments=json.dumps({}),
+        call_id="call_1",
+        name="noop",
+        type="function_call",
+        id="fc_1",
+        status="completed",
+    )
+    return NeMoGymResponse(output=[first, second], **_RESPONSE_KWARGS)
+
+
 _TASK_METADATA = {
     "seed": 7001,
     "difficulty": 0.6,
@@ -195,6 +208,16 @@ class TestReset:
         assert info["dynamics_mode"] == "synthetic_action_effect_v1"
         assert info["action_affects_observation"] is True
         assert info["reward_profile"] == "env_default"
+        assert info["reward_weights"]["w_reject"] > 0.0
+        assert info["observation_render"] == "verbose_v1"
+
+    @pytest.mark.asyncio
+    async def test_compact_observation_render_is_selected_and_stamped(self):
+        env = _make_env(observation_render="t2_compact_pipe_v2")
+        obs, info = await env.reset(dict(_TASK_METADATA), session_id="sid")
+        assert obs.startswith("T|")
+        assert "A|one_tool_call_or_noop" in obs
+        assert info["observation_render"] == "t2_compact_pipe_v2"
 
 
 class TestStep:
@@ -227,27 +250,45 @@ class TestStep:
         assert term is False and trunc is False
 
     @pytest.mark.asyncio
-    async def test_unknown_tool_name_rejected_without_env_step(self):
+    async def test_unknown_tool_name_consumes_penalized_transition(self):
         env = _make_env()
         await env.reset(dict(_TASK_METADATA), session_id="sid")
         obs, reward, term, trunc, info = await env.step(_tool_response("open_pod_bay_doors", {}), {}, session_id="sid")
-        assert reward == 0.0
+        assert math.isfinite(reward)
         assert info["error"] == "invalid_tool_call"
-        assert env.session_state["sid"]["n_steps"] == 0  # env did NOT advance
+        assert info["guardrail_accepted"] is False
+        assert info["reward_terms"]["reject"] < 0.0
+        assert env.session_state["sid"]["n_steps"] == 1
+        assert "Last action: invalid_tool_call" in obs
 
     @pytest.mark.asyncio
-    async def test_no_tool_call_returns_zero_reward_nudge(self):
+    async def test_no_tool_call_consumes_penalized_transition(self):
         env = _make_env()
         await env.reset(dict(_TASK_METADATA), session_id="sid")
         obs, reward, term, trunc, info = await env.step(
             _text_response("Hmm, the PRBs look full."), {}, session_id="sid"
         )
-        assert reward == 0.0
+        assert math.isfinite(reward)
         assert term is False and trunc is False
-        assert "tool call" in obs
+        assert info["error"] == "no_tool_call"
+        assert info["guardrail_accepted"] is False
+        assert info["reward_terms"]["reject"] < 0.0
         assert info["backend"] == "replay"
         assert info["action_affects_observation"] is True
-        assert env.session_state["sid"]["n_steps"] == 0
+        assert env.session_state["sid"]["n_steps"] == 1
+        assert "Last action: no_tool_call" in obs
+
+    @pytest.mark.asyncio
+    async def test_multiple_tool_calls_reject_whole_turn_with_matching_outputs(self):
+        env = _make_env()
+        await env.reset(dict(_TASK_METADATA), session_id="sid")
+        _, reward, _, _, info = await env.step(_multi_tool_response(), {}, session_id="sid")
+        assert math.isfinite(reward)
+        assert info["error"] == "multiple_tool_calls"
+        assert info["guardrail_accepted"] is False
+        assert info["reward_terms"]["reject"] < 0.0
+        assert [item["call_id"] for item in info["tool_outputs"]] == ["call_0", "call_1"]
+        assert env.session_state["sid"]["n_steps"] == 1
 
     @pytest.mark.asyncio
     async def test_reward_accumulates_per_step_like_blackjack(self):
@@ -326,6 +367,12 @@ class TestHTTPSurface:
             assert info["backend"] == "dataset_replay"
             assert info["dynamics_mode"] == "provided_data_passthrough_v1"
             assert info["action_affects_observation"] is False
+            assert info["dataset_identity"].startswith("sha256:")
+            assert info["dataset_sha256"] in info["dataset_identity"]
+            assert info["dataset_row_count"] == 7
+            assert info["dataset_episode_count"] == 2
+            assert info["reward_weights"]["w_reject"] > 0.0
+            assert info["reconstruction_schema"] == "native_snapshot_v1"
 
     @pytest.mark.asyncio
     async def test_close_is_cookie_scoped_and_idempotent(self):
