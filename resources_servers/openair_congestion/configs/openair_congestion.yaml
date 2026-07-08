@@ -19,10 +19,11 @@ openair_congestion:
         per-step KPI reward; the agent sums step rewards into the episode
         return. Runs standalone via the deterministic replay backend.
       value: Stateful multi-turn telco control env (replay backend, no 5G lab/GPU).
-      # Custom keys bound by OpenAirCongestionResourcesServerConfig (config
-      # node type has extra='allow'). backend: 'replay' (default, offline,
-      # CI-safe), 'dataset_replay' (recorded dataset), or 'oai_collector'
-      # (live OAI 5G lab; stub until lab access).
+      # Custom keys are explicitly validated by
+      # OpenAirCongestionResourcesServerConfig; unknown/misspelled keys fail
+      # at startup. backend: 'replay' (default, offline, CI-safe),
+      # 'dataset_replay' (recorded dataset), or 'oai_collector' (live OAI 5G
+      # lab; stub until lab access).
       backend: replay
       replay_root: data/replay
       pool_size: 32
@@ -41,6 +42,7 @@ openair_congestion:
       # backend: dataset_replay
       # dataset_path: data/dataset/provided.jsonl
       # cell_capacity_mbps: 60.0
+      # reward_profile: openair_v2_measured
       # reward_weights must match the profile the dataset was recorded under;
       # openair_v2_measured runs zero the synthetic-proxy terms:
       # reward_weights: {w_sla: 0.0, w_sla_level: 0.0, w_buffer: 0.0, w_action: 0.0}

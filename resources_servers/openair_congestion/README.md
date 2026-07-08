@@ -27,12 +27,12 @@ Tool schemas ride in each task row's `responses_create_params.tools`; the canoni
 | Backend | Runs | Description |
 |---------|------|-------------|
 | `replay` (default) | offline | Deterministic `ReplayEnv` from the env package. The KPI trajectory is pre-baked at reset from the task row's `seed`/`difficulty`/`regime_mix`; `step()` applies a deterministic synthetic action-effect model, the guardrail, and the reward. Identical inputs produce identical episodes. |
-| `dataset_replay` | offline | Replays a provided dataset file (`dataset_backend.py`), in either format below. Actions are pass-through -- the data is pre-recorded -- but the guardrail still runs and rejections still cost the standard penalty. |
+| `dataset_replay` | offline | Replays a provided dataset file (`dataset_backend.py`), in either format below. Actions are observational pass-through: they never change the next recorded KPI row. The only action-dependent signal comes from format/guardrail validity and configured action/rejection terms, so this backend supports protocol-validity learning and data-path tests, not a claim that the policy learned to relieve congestion. |
 | `oai_collector` | online | Live OAI 5G stack via a Prometheus-style KPI exporter. Stub: the constructor raises `NotImplementedError` until the lab wiring lands. The config knobs (`kpi_url`, `oai_pool_size`, `step_dt_s`, `steady_state_s`, `scenario_mode`) are already forwarded by `select_backend`. |
 
 Select with the `backend:` field in `configs/openair_congestion.yaml`. The `OPENAIR_CONGESTION_BACKEND` environment variable overrides it for local development.
 
-Episode slots are finite (`pool_size`). Three guards keep slots from leaking: a repeated `/reset` on the same session closes the previous episode first; task rows lacking `max_steps` fall back to a budget capped at the agent's turn budget (`agent_max_steps` in the yaml must not exceed the gymnasium agent's `max_steps`), so the server always emits a terminal step and `close_session()` runs; and when the pool is exhausted, `reset()` reaps episodes orphaned by crashed rollouts before failing.
+Episode slots are finite (`pool_size`). Four guards keep slots from leaking: a repeated `/reset` on the same session closes the previous episode first; every requested task budget is capped by `agent_max_steps`; terminal `/step` responses close automatically; and a trainer that exits early can call cookie-scoped, idempotent `POST /close`. When the pool is exhausted, `reset()` also reaps episodes no live session owns before failing. Session state is process-local, so the standalone launcher deliberately uses exactly one Uvicorn worker.
 
 ## Setup
 
@@ -83,12 +83,13 @@ One JSON object per RL step, as emitted by GRPO training runs. Only the observat
 | Column | Required | Read as |
 |--------|----------|---------|
 | `reward_measurements` | yes | Aggregate KPI state (the dict `rewards.compute_breakdown` emits), reconstructed into a single-cell observation. `aggregate_delivered_mbps` and `n_ues` are required; the other read keys -- `mean_jain_fairness`, `sla_violations`, `prb_pressure`, `access_pressure`, `buffer_pressure`, `requested_service_mbps` -- default to their uncongested values when absent |
-| `reward_measurements.cell_capacity_mbps_total` | no | Keeps the reward's throughput normalizer at the recorded scale; absent, the `cell_capacity_mbps` config knob applies |
-| `episode_id` | no | Episode grouping; rows without one collapse into a single episode in file order |
+| `reward_measurements.cell_capacity_mbps_total` | no | Keeps that transition's reward normalizer at the recorded scale; absent on a row, the configured `cell_capacity_mbps` applies to the transition ending at that row |
+| `episode_id` | no | Episode grouping; if a merged trace reuses an ID across `iter` values, keys become `iter_N::episode_id` so iterations cannot interleave |
 | `step` | no | Ordering within an episode; falls back to `t_s`, then file order |
+| `iter` | no | GRPO iteration identity; used to disambiguate repeated episode IDs |
 | `kpi_source` | no | Provenance stamp (default `replay`) |
 
-Everything else a trace row carries -- `tool_sent`, `reward`, `reward_terms`, `rejected`, `guardrail_accepted`, `rejection_reason`, `seed`, `scenario_mode`, `iter`, `group_id`, `episode_return`, `episode_advantage`, `raw_text`, `actuator` -- is ignored on replay: actions come from the policy being trained, and rewards and guardrail outcomes are recomputed over the reconstructed observation pairs. (`tool_sent` still matters for format detection: its presence on the first row selects the trace parser.) Reconstruction is exact at the aggregate level -- delivered throughput, mean Jain fairness, PRB/access/buffer pressure, SLA count -- and synthesized below it; replaying a trace's recorded action and guardrail outcome over a reconstructed pair reproduces the recorded per-step reward. A trace fixture is checked in at `data/fixtures/sample_trace.jsonl`.
+Everything else a trace row carries -- `tool_sent`, `reward`, `reward_terms`, `rejected`, `guardrail_accepted`, `rejection_reason`, `seed`, `scenario_mode`, `group_id`, `episode_return`, `episode_advantage`, `raw_text`, `actuator` -- is not replayed as policy behavior: actions come from the policy being trained, and rewards and guardrail outcomes are recomputed over reconstructed observation pairs. (`tool_sent` still selects the trace parser.) The listed aggregate fields are reconstructed, but per-UE service accounting, 5QI mix, and buffer distribution cannot be recovered from aggregates. Reward equivalence therefore requires a compatible trace schema and the exact recorded reward profile; it is not guaranteed for richer reward versions.
 
 ### Replaying a provided dataset
 
@@ -98,9 +99,11 @@ In `configs/openair_congestion.yaml`, under the resources server:
 backend: dataset_replay
 dataset_path: data/dataset/provided.jsonl
 cell_capacity_mbps: 60.0   # reward throughput normalizer
+reward_profile: openair_v2_measured
+reward_weights: {w_sla: 0.0, w_sla_level: 0.0, w_buffer: 0.0, w_action: 0.0}
 ```
 
-Episode selection per rollout: `task_params.scenario_id` exact-matches a dataset episode key (an unknown id raises, listing the available keys); without a `scenario_id`, the pick is deterministic by seed (`keys[seed % num_episodes]`). Task rows for `dataset_replay` must therefore omit `scenario_id` or set it to a dataset episode key -- the shipped `data/example.jsonl` pins replay-backend scenario names (`prb_exhaustion`, `bursty`, ...) and pairs with the default backend only.
+Episode selection per rollout uses this precedence: `task_params.scenario_id` exact-matches a dataset key; otherwise a non-negative `dataset_index` selects `keys[index % num_episodes]`; otherwise the seed is the backward-compatible fallback. GRPO trainers should give every replica in one group the same `dataset_index` and advance it by group, avoiding accidental low-coverage cycles from seed modulo arithmetic. The shipped `data/example.jsonl` pins replay-backend scenario names and pairs with the default backend only.
 
 ## End-to-End Rollout
 
@@ -123,6 +126,20 @@ ng_collect_rollouts \
 ```
 
 Add `+limit=1` for a quick single-episode test.
+
+### Standalone server for a local trainer
+
+No model server or API key is needed when a local trainer owns generation. The standalone launcher serves only the resource API and hardcodes one worker:
+
+```bash
+python -m resources_servers.openair_congestion.serve \
+  --backend dataset_replay \
+  --dataset-path /absolute/path/to/train.jsonl \
+  --reward-profile openair_v2_measured \
+  --max-steps 12 --pool-size 64 --port 9110
+```
+
+Use `--backend replay --port 9111` for an action-responsive synthetic comparison. The `/reset` and `/step` responses expose `backend`, `dynamics_mode`, `action_affects_observation`, and `reward_profile`; dataset steps additionally expose effective weights, transition capacity/source, and dataset key/index for receipts.
 
 ### Scripted client demo
 
@@ -149,4 +166,4 @@ Episode return is the undiscounted sum of per-step reward totals. Each step's re
 
 ## License
 
-Code is Apache-2.0. All telemetry produced by the offline backends is synthetic benchmark data, not measured OAI/FlexRIC KPM.
+Code is Apache-2.0. The default replay backend produces synthetic benchmark telemetry. `dataset_replay` preserves the provenance supplied by its input dataset; operators are responsible for the dataset's privacy, licensing, and measurement claims.

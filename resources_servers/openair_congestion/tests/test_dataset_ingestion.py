@@ -175,22 +175,16 @@ class TestTraceLoader:
         # reconstructed single-cell observation must reproduce every
         # aggregate that trace row recorded.
         rows = [json.loads(line) for line in TRACE_FIXTURE.open()]
-        recorded = next(
-            r for r in rows if r["episode_id"] == "ep_000341" and r["step"] == 1
-        )["reward_measurements"]
+        recorded = next(r for r in rows if r["episode_id"] == "ep_000341" and r["step"] == 1)["reward_measurements"]
         obs = load_provided_dataset(TRACE_FIXTURE)["ep_000341"].observations[1]
         cell = obs.cells[0]
         assert len(obs.cells) == 1
         assert len(cell.ues) == int(recorded["n_ues"])
-        assert sum(ue.delivered_mbps for ue in cell.ues) == pytest.approx(
-            recorded["aggregate_delivered_mbps"]
-        )
+        assert sum(ue.delivered_mbps for ue in cell.ues) == pytest.approx(recorded["aggregate_delivered_mbps"])
         assert cell.fairness_jain == pytest.approx(recorded["mean_jain_fairness"])
         assert cell.sla_violations_last_window == int(recorded["sla_violations"])
         assert cell.prb_util_dl_p99 == pytest.approx(0.85 + 0.15 * recorded["prb_pressure"])
-        assert cell.prach_collision_rate == pytest.approx(
-            0.05 + 0.45 * recorded["access_pressure"]
-        )
+        assert cell.prach_collision_rate == pytest.approx(0.05 + 0.45 * recorded["access_pressure"])
 
     def test_recomputed_reward_measurements_match_the_trace(self):
         # Re-running compute_breakdown over a reconstructed (prev, curr) pair
@@ -199,9 +193,7 @@ class TestTraceLoader:
         from openair_congestion import rewards
 
         rows = [json.loads(line) for line in TRACE_FIXTURE.open()]
-        recorded = next(
-            r for r in rows if r["episode_id"] == "ep_000341" and r["step"] == 1
-        )["reward_measurements"]
+        recorded = next(r for r in rows if r["episode_id"] == "ep_000341" and r["step"] == 1)["reward_measurements"]
         episodes = load_provided_dataset(TRACE_FIXTURE)
         breakdown = rewards.compute_breakdown(
             prev_obs=episodes["ep_000341"].observations[0],
@@ -236,8 +228,12 @@ class TestTraceLoader:
     def test_trace_row_missing_measurements_fails_fast(self, tmp_path):
         bad = tmp_path / "trace.jsonl"
         rows = [
-            {"episode_id": "e", "step": 0, "tool_sent": {"name": "noop", "arguments": {}},
-             "reward_measurements": {"aggregate_delivered_mbps": 10.0, "n_ues": 2}},
+            {
+                "episode_id": "e",
+                "step": 0,
+                "tool_sent": {"name": "noop", "arguments": {}},
+                "reward_measurements": {"aggregate_delivered_mbps": 10.0, "n_ues": 2},
+            },
             {"episode_id": "e", "step": 1, "tool_sent": {"name": "noop", "arguments": {}}},
         ]
         bad.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
@@ -246,18 +242,30 @@ class TestTraceLoader:
 
     def test_trace_row_missing_required_key_names_it(self, tmp_path):
         bad = tmp_path / "trace.jsonl"
-        row = {"episode_id": "e", "step": 0,
-               "reward_measurements": {"aggregate_delivered_mbps": 10.0}}
+        row = {"episode_id": "e", "step": 0, "reward_measurements": {"aggregate_delivered_mbps": 10.0}}
         bad.write_text(json.dumps(row) + "\n")
         with pytest.raises(ValueError, match="n_ues"):
             load_provided_dataset(bad)
 
-    def test_recorded_cell_capacity_is_loaded_per_episode(self):
+    def test_recorded_cell_capacity_is_loaded_per_observation(self):
         episodes = load_provided_dataset(TRACE_FIXTURE)
-        assert episodes["ep_000341"].cell_capacity_mbps == pytest.approx(120.0)
-        assert episodes["ep_000342"].cell_capacity_mbps == pytest.approx(120.0)
+        assert episodes["ep_000341"].cell_capacity_mbps_by_observation == (
+            120.0,
+            120.0,
+            120.0,
+        )
+        assert episodes["ep_000342"].cell_capacity_mbps_by_observation == (
+            None,
+            120.0,
+            120.0,
+        )
         # Snapshot data records no capacity; the config knob applies.
-        assert load_provided_dataset(SNAPSHOT_FIXTURE)["lab_run_a"].cell_capacity_mbps is None
+        assert load_provided_dataset(SNAPSHOT_FIXTURE)["lab_run_a"].cell_capacity_mbps_by_observation == (
+            None,
+            None,
+            None,
+            None,
+        )
 
     def test_replaying_recorded_actions_reproduces_recorded_rewards(self):
         # With the recorded action, guardrail outcome, and
@@ -276,7 +284,7 @@ class TestTraceLoader:
                     curr_obs=obs[step],
                     action=ToolCall(**row["tool_sent"]),
                     rejected=row["rejected"],
-                    cell_capacity_mbps=episodes[key].cell_capacity_mbps,
+                    cell_capacity_mbps=episodes[key].cell_capacity_mbps_by_observation[step],
                 )
                 assert breakdown["total"] == pytest.approx(row["reward"]), (key, step)
 
@@ -291,6 +299,8 @@ class TestTraceLoader:
             row = next(r for r in rows if r["episode_id"] == "ep_000341" and r["step"] == step)
             _, reward, _, info = backend.step(meta.episode_id, ToolCall(**row["tool_sent"]))
             assert info["guardrail_accepted"] is True
+            assert info["cell_capacity_mbps"] == pytest.approx(120.0)
+            assert info["cell_capacity_source"] == "recorded_transition"
             assert reward == pytest.approx(row["reward"])
         backend.close(meta.episode_id)
 
@@ -305,8 +315,97 @@ class TestTraceLoader:
             assert math.isfinite(reward)
             assert info["step_idx"] == expected_idx
             assert info["dynamics_mode"] == DATASET_DYNAMICS_MODE
+            assert info["action_affects_observation"] is False
             assert done is (expected_idx == 2)
         backend.close(meta.episode_id)
+
+    def test_reused_episode_ids_are_namespaced_by_iteration(self, tmp_path):
+        path = tmp_path / "merged_trace.jsonl"
+
+        def row(iteration: int, step: int, delivered: float) -> dict:
+            return {
+                "iter": iteration,
+                "episode_id": "shared",
+                "step": step,
+                "tool_sent": {"name": "noop", "arguments": {}},
+                "reward_measurements": {
+                    "aggregate_delivered_mbps": delivered,
+                    "n_ues": 1,
+                    "cell_capacity_mbps_total": 100.0,
+                },
+            }
+
+        rows = [row(0, 0, 10.0), row(1, 0, 20.0), row(0, 1, 11.0), row(1, 1, 21.0)]
+        path.write_text("\n".join(json.dumps(item) for item in rows) + "\n")
+        episodes = load_provided_dataset(path)
+        assert sorted(episodes) == ["iter_0::shared", "iter_1::shared"]
+        assert episodes["iter_0::shared"].observations[1].cells[0].ues[0].delivered_mbps == 11.0
+        assert episodes["iter_1::shared"].observations[1].cells[0].ues[0].delivered_mbps == 21.0
+
+    def test_duplicate_step_within_iteration_is_rejected(self, tmp_path):
+        path = tmp_path / "duplicate_trace.jsonl"
+        row = {
+            "iter": 0,
+            "episode_id": "shared",
+            "step": 0,
+            "tool_sent": {"name": "noop", "arguments": {}},
+            "reward_measurements": {"aggregate_delivered_mbps": 10.0, "n_ues": 1},
+        }
+        path.write_text(json.dumps(row) + "\n" + json.dumps(row) + "\n")
+        with pytest.raises(ValueError, match="duplicate step"):
+            load_provided_dataset(path)
+
+    def test_transition_uses_capacity_from_destination_row(self, tmp_path):
+        path = tmp_path / "changing_capacity.jsonl"
+        rows = []
+        for step, capacity in enumerate((100.0, 200.0, 400.0)):
+            rows.append(
+                {
+                    "iter": 0,
+                    "episode_id": "changing",
+                    "step": step,
+                    "tool_sent": {"name": "noop", "arguments": {}},
+                    "reward_measurements": {
+                        "aggregate_delivered_mbps": 10.0 + step,
+                        "n_ues": 1,
+                        "cell_capacity_mbps_total": capacity,
+                    },
+                }
+            )
+        path.write_text("\n".join(json.dumps(item) for item in rows) + "\n")
+        backend = _make_backend(
+            dataset_path=str(path),
+            reward_profile="openair_v2_measured",
+            reward_weights={"w_sla": 0.0, "w_sla_level": 0.0, "w_buffer": 0.0, "w_action": 0.0},
+        )
+        _, meta = backend.reset({"scenario_id": "changing"})
+        _, _, _, first_info = backend.step(meta.episode_id, NOOP)
+        _, _, _, second_info = backend.step(meta.episode_id, NOOP)
+        assert first_info["cell_capacity_mbps"] == pytest.approx(200.0)
+        assert second_info["cell_capacity_mbps"] == pytest.approx(400.0)
+        assert first_info["reward_profile"] == "openair_v2_measured"
+        assert first_info["reward_weights"]["w_sla"] == 0.0
+        assert first_info["action_affects_observation"] is False
+        backend.close(meta.episode_id)
+
+    def test_nonpositive_or_nonfinite_recorded_capacity_is_rejected(self, tmp_path):
+        path = tmp_path / "bad_capacity.jsonl"
+        rows = [
+            {
+                "episode_id": "e",
+                "step": step,
+                "tool_sent": {"name": "noop", "arguments": {}},
+                "reward_measurements": {
+                    "aggregate_delivered_mbps": 10.0,
+                    "n_ues": 1,
+                    "cell_capacity_mbps_total": capacity,
+                },
+            }
+            for step, capacity in enumerate((100.0, 0.0))
+        ]
+        path.write_text("\n".join(json.dumps(item) for item in rows) + "\n")
+        with pytest.raises(ValueError, match="finite and positive"):
+            load_provided_dataset(path)
 
 
 class TestDatasetReplayBackend:
@@ -332,6 +431,23 @@ class TestDatasetReplayBackend:
         assert meta2.scenario_id == "lab_run_a"  # wraps
         for meta in (meta0, meta1, meta2):
             backend.close(meta.episode_id)
+
+    def test_dataset_index_cycles_independently_of_seed(self):
+        backend = _make_backend()
+        _, meta0 = backend.reset({"seed": 999, "dataset_index": 0})
+        _, meta1 = backend.reset({"seed": 999, "dataset_index": 1})
+        _, meta2 = backend.reset({"seed": 999, "dataset_index": 2})
+        assert meta0.scenario_id == "lab_run_a"
+        assert meta1.scenario_id == "lab_run_b"
+        assert meta2.scenario_id == "lab_run_a"
+        for meta in (meta0, meta1, meta2):
+            backend.close(meta.episode_id)
+
+    @pytest.mark.parametrize("dataset_index", [-1, True, 1.5, "abc", float("inf"), float("nan")])
+    def test_invalid_dataset_index_is_rejected(self, dataset_index):
+        backend = _make_backend()
+        with pytest.raises(ValueError, match="dataset_index"):
+            backend.reset({"dataset_index": dataset_index})
 
     def test_step_replays_provided_data_and_computes_reward(self):
         backend = _make_backend()

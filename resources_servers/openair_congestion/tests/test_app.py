@@ -21,10 +21,12 @@
 # skipped, not failed, if the package is missing.
 import json
 import math
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from nemo_gym.openai_utils import (
     NeMoGymResponse,
@@ -106,6 +108,7 @@ _TASK_METADATA = {
     "tier": "replay",
     "max_steps": 16,
 }
+_DATASET_FIXTURE = Path(__file__).resolve().parent.parent / "data" / "fixtures" / "sample_provided.jsonl"
 
 
 class TestReset:
@@ -169,6 +172,30 @@ class TestReset:
         await env.reset(metadata, session_id="sid")
         assert env.session_state["sid"]["max_agent_steps"] == 16
 
+    @pytest.mark.asyncio
+    async def test_explicit_task_budget_is_capped_to_agent_budget(self):
+        env = _make_env(agent_max_steps=16, max_steps_default=60)
+        _, info = await env.reset(dict(_TASK_METADATA, max_steps=60), session_id="sid")
+        assert env.session_state["sid"]["max_agent_steps"] == 16
+        assert info["max_steps"] == 16
+
+    @pytest.mark.parametrize("max_steps", [0, 1.5, True, float("inf"), float("nan")])
+    @pytest.mark.asyncio
+    async def test_invalid_task_budget_fails_before_allocating_episode(self, max_steps):
+        env = _make_env()
+        with pytest.raises(ValueError, match="positive integer"):
+            await env.reset(dict(_TASK_METADATA, max_steps=max_steps), session_id="sid")
+        assert env.session_state == {}
+
+    @pytest.mark.asyncio
+    async def test_reset_exposes_backend_semantics(self):
+        env = _make_env()
+        _, info = await env.reset(dict(_TASK_METADATA), session_id="sid")
+        assert info["backend"] == "replay"
+        assert info["dynamics_mode"] == "synthetic_action_effect_v1"
+        assert info["action_affects_observation"] is True
+        assert info["reward_profile"] == "env_default"
+
 
 class TestStep:
     @pytest.mark.asyncio
@@ -218,6 +245,8 @@ class TestStep:
         assert reward == 0.0
         assert term is False and trunc is False
         assert "tool call" in obs
+        assert info["backend"] == "replay"
+        assert info["action_affects_observation"] is True
         assert env.session_state["sid"]["n_steps"] == 0
 
     @pytest.mark.asyncio
@@ -259,7 +288,7 @@ class TestRoutes:
     def test_gymnasium_routes_registered(self):
         env = _make_env()
         routes = {r.path for r in env.setup_webserver().routes}
-        assert {"/reset", "/step", "/aggregate_metrics"}.issubset(routes)
+        assert {"/reset", "/step", "/close", "/aggregate_metrics"}.issubset(routes)
 
 
 def _http_client(app) -> httpx.AsyncClient:
@@ -283,6 +312,46 @@ def _step_body(name: str, arguments: dict) -> dict:
 
 
 class TestHTTPSurface:
+    @pytest.mark.asyncio
+    async def test_dataset_index_is_forwarded_and_semantics_are_exposed(self):
+        env = _make_env(backend="dataset_replay", dataset_path=str(_DATASET_FIXTURE))
+        async with _http_client(env.setup_webserver()) as client:
+            response = await client.post(
+                "/reset",
+                json=_reset_body(scenario_id=None, dataset_index=1),
+            )
+            assert response.status_code == 200
+            info = response.json()["info"]
+            assert info["scenario_id"] == "lab_run_b"
+            assert info["backend"] == "dataset_replay"
+            assert info["dynamics_mode"] == "provided_data_passthrough_v1"
+            assert info["action_affects_observation"] is False
+
+    @pytest.mark.asyncio
+    async def test_close_is_cookie_scoped_and_idempotent(self):
+        env = _make_env(pool_size=1)
+        app = env.setup_webserver()
+        async with _http_client(app) as owner, _http_client(app) as stranger:
+            reset = await owner.post("/reset", json=_reset_body())
+            episode_id = reset.json()["info"]["episode_id"]
+            assert len(env.session_state) == 1
+
+            # A different cookie cannot name or release the owner's episode.
+            response = await stranger.post("/close", json={"episode_id": episode_id})
+            assert response.status_code == 200
+            assert response.json() == {"ok": True, "closed": False}
+            assert len(env.session_state) == 1
+
+            response = await owner.post("/close", json={})
+            assert response.json() == {"ok": True, "closed": True}
+            assert env.session_state == {}
+
+            # Repeating close is a successful no-op and the pool slot is free.
+            response = await owner.post("/close", json={})
+            assert response.json() == {"ok": True, "closed": False}
+            reset_again = await stranger.post("/reset", json=_reset_body(seed=7002))
+            assert reset_again.status_code == 200
+
     @pytest.mark.asyncio
     async def test_interleaved_sessions_step_independently_over_http(self):
         # Two clients (= two session cookies) with interleaved /step calls:
@@ -360,12 +429,49 @@ class TestBackends:
 
     def test_select_backend_rejects_unknown_name(self, monkeypatch):
         monkeypatch.delenv("OPENAIR_CONGESTION_BACKEND", raising=False)
-        config = OpenAirCongestionResourcesServerConfig(
-            host="", port=0, entrypoint="", name="", backend="flexric_dreams"
-        )
-        with pytest.raises(ValueError, match="unknown backend"):
-            select_backend(config)
+        with pytest.raises(ValidationError, match="backend"):
+            OpenAirCongestionResourcesServerConfig(host="", port=0, entrypoint="", name="", backend="flexric_dreams")
 
     def test_oai_collector_is_a_stub_until_lab_access(self):
         with pytest.raises(NotImplementedError, match="lab access"):
             OAICollectorBackend()
+
+
+class TestConfigValidation:
+    def test_reward_weights_are_explicit_and_forwarded(self):
+        config = OpenAirCongestionResourcesServerConfig(
+            host="",
+            port=0,
+            entrypoint="",
+            name="",
+            backend="dataset_replay",
+            dataset_path=str(_DATASET_FIXTURE),
+            reward_profile="openair_v2_measured",
+            reward_weights={
+                "w_sla": 0.0,
+                "w_sla_level": 0.0,
+                "w_buffer": 0.0,
+                "w_action": 0.0,
+            },
+        )
+        backend = select_backend(config)
+        assert backend.reward_profile == "openair_v2_measured"
+        assert backend.reward_weights_dict["w_sla"] == 0.0
+        assert backend.reward_weights_dict["w_reject"] > 0.0
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"reward_weights": {"w_typo": 1.0}},
+            {"reward_weights": {"w_reject": -1.0}},
+            {"cell_capacity_mbps": float("inf")},
+            {"pool_size": 0},
+            {"misspelled_reward_profile": "v2"},
+            {"reward_profile": "openair_v2_measured"},
+            {"reward_profile": "openair_v1", "reward_weights": {"w_sla": 0.0}},
+            {"reward_profile": "custom"},
+        ],
+    )
+    def test_bad_or_unknown_config_fails_at_startup(self, overrides):
+        with pytest.raises(ValidationError):
+            OpenAirCongestionResourcesServerConfig(host="", port=0, entrypoint="", name="", **overrides)

@@ -34,15 +34,24 @@ and must be importable in this venv; see the README Setup section.
 from __future__ import annotations
 
 import json
-from typing import Any, Optional
+import math
+from typing import Any, Literal, Optional
+
+from fastapi import FastAPI, Request
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from nemo_gym.base_resources_server import BaseResourcesServerConfig
 from nemo_gym.openai_utils import NeMoGymResponse, NeMoGymResponseFunctionToolCall
+from nemo_gym.server_utils import SESSION_ID_KEY
 from resources_servers.gymnasium import GymnasiumServer
 
 # backends guards the cross-repo 'openair_congestion' import; keep it ahead of
 # the telco imports so a missing install fails with the pip hint.
-from resources_servers.openair_congestion.backends import Backend, select_backend
+from resources_servers.openair_congestion.backends import (
+    Backend,
+    select_backend,
+    validate_reward_profile,
+)
 
 
 # isort: split
@@ -50,27 +59,68 @@ from openair_congestion.render import to_user_text
 from openair_congestion.schemas import ToolCall
 
 
+class RewardWeightOverrides(BaseModel):
+    """Validated overrides for ``openair_congestion.rewards.RewardWeights``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    w_sla: Optional[float] = Field(default=None, ge=0.0, allow_inf_nan=False)
+    w_tput: Optional[float] = Field(default=None, ge=0.0, allow_inf_nan=False)
+    w_fair: Optional[float] = Field(default=None, ge=0.0, allow_inf_nan=False)
+    w_buffer: Optional[float] = Field(default=None, ge=0.0, allow_inf_nan=False)
+    w_sla_level: Optional[float] = Field(default=None, ge=0.0, allow_inf_nan=False)
+    w_prb_level: Optional[float] = Field(default=None, ge=0.0, allow_inf_nan=False)
+    w_access_level: Optional[float] = Field(default=None, ge=0.0, allow_inf_nan=False)
+    w_fair_level: Optional[float] = Field(default=None, ge=0.0, allow_inf_nan=False)
+    w_action: Optional[float] = Field(default=None, ge=0.0, allow_inf_nan=False)
+    w_reject: Optional[float] = Field(default=None, ge=0.0, allow_inf_nan=False)
+
+
 class OpenAirCongestionResourcesServerConfig(BaseResourcesServerConfig):
+    model_config = ConfigDict(extra="forbid")
+
+    # Resource-catalog metadata present in the normal Gym YAML.
+    verified: bool = False
+    description: Optional[str] = None
+    value: Optional[str] = None
+
     # Which Backend drives episodes: 'replay' (default, offline/CI-safe),
     # 'dataset_replay', or 'oai_collector' (live lab; stub today). The
-    # OPENAIR_CONGESTION_BACKEND env var overrides. Extra YAML keys bind here
-    # because the config node type uses ConfigDict(extra='allow').
-    backend: str = "replay"
+    # OPENAIR_CONGESTION_BACKEND env var overrides. Unknown YAML keys fail at
+    # startup so misspelled reward or live-backend settings cannot be ignored.
+    backend: Literal["replay", "dataset_replay", "oai_collector"] = "replay"
     # Replay-backend knobs; defaults match openair_congestion.replay_env.ReplayEnv.
-    replay_root: str = "data/replay"
-    pool_size: int = 32
-    max_steps_default: int = 60
+    replay_root: str = Field(default="data/replay", min_length=1)
+    pool_size: int = Field(default=32, gt=0)
+    max_steps_default: int = Field(default=60, gt=0)
     # dataset_replay knobs: replay a recorded dataset (KPI snapshots or GRPO
     # rollout traces; see dataset_backend.py) instead of synthesizing
     # trajectories. cell_capacity_mbps feeds the reward's throughput
     # normalizer; trace episodes recording cell_capacity_mbps_total override it.
-    dataset_path: str = "data/dataset/provided.jsonl"
-    cell_capacity_mbps: float = 60.0
+    dataset_path: str = Field(default="data/dataset/provided.jsonl", min_length=1)
+    cell_capacity_mbps: float = Field(default=60.0, gt=0.0, allow_inf_nan=False)
+    reward_profile: Literal["openair_v1", "openair_v2_measured", "custom"] = "openair_v1"
+    reward_weights: Optional[RewardWeightOverrides] = None
     # Truncation-budget fallback for task rows that omit max_steps. Must not
     # exceed the gymnasium_agent's max_steps in the yaml: the agent truncates
     # client-side without notifying the env, so a larger server budget would
     # strand the backend episode slot.
-    agent_max_steps: int = 16
+    agent_max_steps: int = Field(default=16, gt=0)
+
+    # Explicitly declared live-backend settings. The backend is still a stub,
+    # but validating these now prevents a future deployment from silently
+    # dropping a misspelled control-plane setting.
+    kpi_url: Optional[str] = None
+    oai_pool_size: Optional[int] = Field(default=None, gt=0)
+    step_dt_s: float = Field(default=1.0, ge=0.0, allow_inf_nan=False)
+    steady_state_s: float = Field(default=1.0, ge=0.0, allow_inf_nan=False)
+    scenario_mode: Optional[str] = None
+
+    @model_validator(mode="after")
+    def bind_reward_profile_to_weights(self) -> "OpenAirCongestionResourcesServerConfig":
+        overrides = self.reward_weights.model_dump(exclude_none=True) if self.reward_weights else None
+        validate_reward_profile(self.reward_profile, overrides)
+        return self
 
 
 # Returned (with 0.0 reward, env not advanced) when the model's turn contains
@@ -103,6 +153,29 @@ class OpenAirCongestionEnv(GymnasiumServer):
         """Episode ids currently owned by live sessions (for the leak reaper)."""
         return {state["episode_id"] for state in self.session_state.values()}
 
+    def _backend_receipt_info(self) -> dict[str, Any]:
+        return {
+            "backend": self.backend.backend_name,
+            "dynamics_mode": self.backend.dynamics_mode,
+            "action_affects_observation": self.backend.action_affects_observation,
+            "reward_profile": self.backend.reward_profile,
+        }
+
+    def setup_webserver(self) -> FastAPI:
+        app = super().setup_webserver()
+        # Gymnasium's terminal /step cleanup remains the normal path. This
+        # explicit endpoint lets a trainer release a cookie-owned episode on
+        # context truncation, cancellation, or any other early exit.
+        app.post("/close")(self._close_endpoint)
+        return app
+
+    async def _close_endpoint(self, request: Request) -> dict[str, Any]:
+        """Idempotently close only the episode owned by this session cookie."""
+        session_id = request.session.get(SESSION_ID_KEY)
+        closed = session_id in self.session_state
+        await self.close_session(session_id)
+        return {"ok": True, "closed": closed}
+
     async def reset(self, metadata: dict, session_id: Optional[str] = None) -> tuple[Optional[str], dict]:
         # A client retry can POST /reset twice with the same session cookie.
         # Close the previous episode first or its backend slot leaks forever.
@@ -116,10 +189,39 @@ class OpenAirCongestionEnv(GymnasiumServer):
         # `metadata` = extra task-row fields forwarded by gymnasium_agent.
         task_params = {
             key: metadata[key]
-            for key in ("seed", "difficulty", "regime_mix", "scenario_id", "tier", "max_steps")
+            for key in (
+                "seed",
+                "difficulty",
+                "regime_mix",
+                "scenario_id",
+                "tier",
+                "max_steps",
+                "dataset_index",
+            )
             if metadata.get(key) is not None
         }
+
+        requested_steps_raw = task_params.get("max_steps", self.config.max_steps_default)
+        if isinstance(requested_steps_raw, bool):
+            raise ValueError("max_steps must be a positive integer, not bool")
+        try:
+            requested_steps_numeric = float(requested_steps_raw)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"max_steps must be a positive integer, got {requested_steps_raw!r}") from exc
+        if (
+            not math.isfinite(requested_steps_numeric)
+            or requested_steps_numeric <= 0
+            or not requested_steps_numeric.is_integer()
+        ):
+            raise ValueError(f"max_steps must be a positive integer, got {requested_steps_raw!r}")
+        requested_steps = int(requested_steps_numeric)
+        effective_steps = min(requested_steps, self.config.agent_max_steps)
+        # Give the backend the same cap as the HTTP lifecycle. This keeps its
+        # EpisodeMeta, terminal step, and the trainer's turn budget aligned.
+        task_params["max_steps"] = effective_steps
+
         first_obs, meta = self.backend.reset(task_params, live_episode_ids=self._live_episode_ids())
+        max_agent_steps = min(effective_steps, int(meta.max_steps))
         self.session_state[session_id] = {
             "episode_id": meta.episode_id,
             "cumulative_reward": 0.0,
@@ -129,17 +231,18 @@ class OpenAirCongestionEnv(GymnasiumServer):
             "agent_steps": 0,
             # Cap at the agent's turn budget so the server truncates no later
             # than the agent and the episode slot is freed via close_session().
-            "max_agent_steps": int(
-                task_params.get("max_steps") or min(self.config.max_steps_default, self.config.agent_max_steps)
-            ),
+            "max_agent_steps": max_agent_steps,
         }
         # Observation appended as a user message after the dataset prompt.
-        return to_user_text(first_obs), {
+        reset_info = {
             "episode_id": meta.episode_id,
             "seed": meta.seed,
             "scenario_id": meta.scenario_id,
             "tier": meta.tier,
+            "max_steps": meta.max_steps,
         }
+        reset_info.update(self._backend_receipt_info())
+        return to_user_text(first_obs), reset_info
 
     async def step(
         self, action: NeMoGymResponse, metadata: dict, session_id: Optional[str] = None
@@ -147,7 +250,9 @@ class OpenAirCongestionEnv(GymnasiumServer):
         state = self.session_state.get(session_id)
         if state is None:
             # /step without /reset (defensive; gymnasium_agent always resets).
-            return None, 0.0, False, True, {"error": "no_active_episode"}
+            info = {"error": "no_active_episode"}
+            info.update(self._backend_receipt_info())
+            return None, 0.0, False, True, info
 
         state["agent_steps"] += 1
         out_of_budget = state["agent_steps"] >= state["max_agent_steps"]
@@ -156,12 +261,14 @@ class OpenAirCongestionEnv(GymnasiumServer):
 
         # No tool call this turn: 0.0 reward, env not stepped, nudge the model.
         if not calls:
+            info = {"error": "no_tool_call", "tool_outputs": []}
+            info.update(self._backend_receipt_info())
             return (
                 None if out_of_budget else _NO_TOOL_CALL_MSG,
                 0.0,
                 False,
                 out_of_budget,
-                {"error": "no_tool_call", "tool_outputs": []},
+                info,
             )
 
         # Exactly one tool call per turn: apply the first, answer extras with
@@ -183,12 +290,14 @@ class OpenAirCongestionEnv(GymnasiumServer):
             tool_call = ToolCall(name=call.name, arguments=raw_args)
         except ValueError as exc:
             tool_outputs.insert(0, self.tool_output(call, {"accepted": False, "error": str(exc)}))
+            info = {"error": "invalid_tool_call", "tool_outputs": tool_outputs}
+            info.update(self._backend_receipt_info())
             return (
                 None if out_of_budget else "Invalid tool call rejected; telemetry unchanged.",
                 0.0,
                 False,
                 out_of_budget,
-                {"error": "invalid_tool_call", "tool_outputs": tool_outputs},
+                info,
             )
 
         # One env step. In-range-but-rejected actions (guardrail) come back as
@@ -215,11 +324,8 @@ class OpenAirCongestionEnv(GymnasiumServer):
         truncated = (not terminated) and out_of_budget
         observation = None if (terminated or truncated) else to_user_text(next_obs)
 
-        return (
-            observation,
-            float(reward),
-            terminated,
-            truncated,
+        response_info = dict(step_info)
+        response_info.update(
             {
                 "tool_outputs": tool_outputs,
                 "guardrail_accepted": accepted,
@@ -228,7 +334,16 @@ class OpenAirCongestionEnv(GymnasiumServer):
                 "episode_id": state["episode_id"],
                 "n_steps": state["n_steps"],
                 "cumulative_reward": state["cumulative_reward"],
-            },
+            }
+        )
+        response_info.update(self._backend_receipt_info())
+
+        return (
+            observation,
+            float(reward),
+            terminated,
+            truncated,
+            response_info,
         )
 
     async def close_session(self, session_id: Optional[str]) -> None:

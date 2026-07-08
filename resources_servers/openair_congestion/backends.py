@@ -73,6 +73,33 @@ from openair_congestion.replay_env import ReplayEnv  # noqa: E402
 from openair_congestion.schemas import EpisodeMeta, Observation, ToolCall  # noqa: E402
 
 
+NAMED_REWARD_PROFILE_OVERRIDES: dict[str, dict[str, float]] = {
+    "openair_v1": {},
+    "openair_v2_measured": {
+        "w_sla": 0.0,
+        "w_sla_level": 0.0,
+        "w_buffer": 0.0,
+        "w_action": 0.0,
+    },
+}
+
+
+def validate_reward_profile(profile: str, overrides: Optional[dict[str, float]]) -> None:
+    """Keep the receipt label bound to the effective named-profile overrides."""
+    supplied = overrides or {}
+    if profile == "custom":
+        if not supplied:
+            raise ValueError("reward_profile='custom' requires non-empty reward_weights")
+        return
+    expected = NAMED_REWARD_PROFILE_OVERRIDES.get(profile)
+    if expected is None:
+        raise ValueError(
+            f"unknown reward_profile {profile!r}; valid: {sorted(NAMED_REWARD_PROFILE_OVERRIDES)} + ['custom']"
+        )
+    if supplied != expected:
+        raise ValueError(f"reward_profile={profile!r} requires exact reward_weights={expected!r}; got {supplied!r}")
+
+
 class TelemetryDriver(Protocol):
     """KPI read-path seam for online backends.
 
@@ -96,6 +123,11 @@ class Backend(ABC):
     task row (seed / difficulty / regime_mix / scenario_id / tier /
     max_steps); keys map 1:1 onto ``ReplayEnv.reset()`` keyword arguments.
     """
+
+    backend_name = "unknown"
+    dynamics_mode = "unknown"
+    action_affects_observation = False
+    reward_profile = "unknown"
 
     @abstractmethod
     def reset(
@@ -136,6 +168,11 @@ class ReplayBackend(Backend):
     referenced by any live session (``live_episode_ids``) are closed as leaked
     and the reset is retried exactly once.
     """
+
+    backend_name = "replay"
+    dynamics_mode = "synthetic_action_effect_v1"
+    action_affects_observation = True
+    reward_profile = "env_default"
 
     def __init__(
         self,
@@ -227,6 +264,11 @@ class OAICollectorBackend(Backend):
     (2 cells x 4 UEs), and the lab 5G docker stack itself.
     """
 
+    backend_name = "oai_collector"
+    dynamics_mode = "live_oai_collector"
+    action_affects_observation = True
+    reward_profile = "env_default"
+
     def __init__(
         self,
         *,
@@ -280,12 +322,17 @@ def select_backend(config: Any) -> Backend:
             DatasetReplayBackend,
         )
 
+        reward_weights = getattr(config, "reward_weights", None)
+        if hasattr(reward_weights, "model_dump"):
+            reward_weights = reward_weights.model_dump(exclude_none=True)
+
         return DatasetReplayBackend(
             dataset_path=getattr(config, "dataset_path", "data/dataset/provided.jsonl"),
             pool_size=getattr(config, "pool_size", 32),
             max_steps_default=getattr(config, "max_steps_default", 60),
             cell_capacity_mbps=getattr(config, "cell_capacity_mbps", 60.0),
-            reward_weights=getattr(config, "reward_weights", None),
+            reward_profile=getattr(config, "reward_profile", "openair_v1"),
+            reward_weights=reward_weights,
         )
     if name == "oai_collector":
         # Forward all documented knobs now (the stub ignores them) so the
@@ -300,6 +347,4 @@ def select_backend(config: Any) -> Backend:
             scenario_mode=getattr(config, "scenario_mode", None),
             max_steps_default=getattr(config, "max_steps_default", 60),
         )
-    raise ValueError(
-        f"unknown backend {name!r}; valid: 'replay', 'dataset_replay', 'oai_collector'"
-    )
+    raise ValueError(f"unknown backend {name!r}; valid: 'replay', 'dataset_replay', 'oai_collector'")

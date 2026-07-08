@@ -33,7 +33,7 @@ the README for the column contract of each):
   single-cell observation whose aggregate KPIs — delivered throughput, mean
   Jain fairness, PRB/access/buffer pressure, SLA violation count — reproduce
   the recorded measurements, and a recorded ``cell_capacity_mbps_total``
-  keeps the reward's throughput normalizer at the recorded scale. Per-UE
+  keeps each transition's reward normalizer at the recorded scale. Per-UE
   structure is not recoverable from aggregates: throughput is spread evenly
   across ``n_ues`` identical UEs, so per-UE quantities (elastic Jain
   fairness, individual buffers, 5QI mix) are flattened.
@@ -52,13 +52,13 @@ import json
 import math
 import threading
 import uuid
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Optional
 
 # backends guards the cross-repo 'openair_congestion' import; keep it ahead of
 # the telco imports so a missing install fails with the pip hint.
-from resources_servers.openair_congestion.backends import Backend
+from resources_servers.openair_congestion.backends import Backend, validate_reward_profile
 
 
 # isort: split
@@ -113,8 +113,7 @@ def _parse_ue(raw: dict[str, Any], ue_idx: int) -> dict[str, Any]:
     """
     if "delivered_mbps" not in raw:
         raise ValueError(
-            f"dataset UE record #{ue_idx} is missing required field "
-            f"'delivered_mbps'; got keys {sorted(raw)}"
+            f"dataset UE record #{ue_idx} is missing required field 'delivered_mbps'; got keys {sorted(raw)}"
         )
     delivered = max(0.0, float(raw["delivered_mbps"]))
     offered = max(0.0, _num(raw, "offered_mbps", max(delivered, 1.0)))
@@ -147,8 +146,7 @@ def _parse_cell(raw: dict[str, Any], cell_idx: int) -> dict[str, Any]:
     """
     if "prb_util_dl_p50" not in raw:
         raise ValueError(
-            f"dataset cell record #{cell_idx} is missing required field "
-            f"'prb_util_dl_p50'; got keys {sorted(raw)}"
+            f"dataset cell record #{cell_idx} is missing required field 'prb_util_dl_p50'; got keys {sorted(raw)}"
         )
     ues_raw = raw.get("ues") or []
     if not ues_raw:
@@ -169,11 +167,13 @@ def _parse_cell(raw: dict[str, Any], cell_idx: int) -> dict[str, Any]:
         0.0 if n_ues < 8 else min(0.5, 0.01 * (n_ues - 8) ** 2),
     )
     fairness = _num(raw, "fairness_jain", _jain([u["delivered_mbps"] for u in ues]))
-    sla = int(_num(
-        raw,
-        "sla_violations_last_window",
-        sum(1 for u in ues if u["pdb_violations"] > 0),
-    ))
+    sla = int(
+        _num(
+            raw,
+            "sla_violations_last_window",
+            sum(1 for u in ues if u["pdb_violations"] > 0),
+        )
+    )
     return {
         "cell_id": int(raw.get("cell_id", cell_idx)),
         "prb_util_dl_p50": p50,
@@ -211,9 +211,7 @@ def row_to_observation(
         "cells": cells,
         "global": {
             "n_cells": int(global_raw.get("n_cells", len(cells))),
-            "n_ues_total": int(
-                global_raw.get("n_ues_total", sum(len(c["ues"]) for c in cells))
-            ),
+            "n_ues_total": int(global_raw.get("n_ues_total", sum(len(c["ues"]) for c in cells))),
             "difficulty": float(global_raw.get("difficulty", 0.5)),
             "regime_mix": global_raw.get("regime_mix") or {},
             "tier": global_raw.get("tier", "replay"),
@@ -257,15 +255,11 @@ def trace_row_to_snapshot(row: dict[str, Any]) -> dict[str, Any]:
     """
     measurements = row.get("reward_measurements")
     if not isinstance(measurements, dict):
-        raise ValueError(
-            "trace row is missing the 'reward_measurements' object; got keys "
-            f"{sorted(row)}"
-        )
+        raise ValueError(f"trace row is missing the 'reward_measurements' object; got keys {sorted(row)}")
     for key in ("aggregate_delivered_mbps", "n_ues"):
         if key not in measurements:
             raise ValueError(
-                f"trace row reward_measurements is missing required key {key!r}; "
-                f"got keys {sorted(measurements)}"
+                f"trace row reward_measurements is missing required key {key!r}; got keys {sorted(measurements)}"
             )
 
     n_ues = max(1, min(_MAX_UES, int(_num(measurements, "n_ues", 1))))
@@ -301,6 +295,10 @@ def trace_row_to_snapshot(row: dict[str, Any]) -> dict[str, Any]:
     snapshot: dict[str, Any] = {
         "episode_id": row.get("episode_id"),
         "step": row.get("step"),
+        # Retain the GRPO iteration as ingestion-only identity metadata. It
+        # is not part of Observation, but it prevents repeated episode IDs
+        # from different iterations being silently interleaved.
+        "_source_iter": row.get("iter"),
         "kpi_source_mode": str(row.get("kpi_source", "replay")),
         "cell_capacity_mbps_total": measurements.get("cell_capacity_mbps_total"),
         "cells": [
@@ -385,18 +383,47 @@ class EpisodeSource:
     """One recorded episode: validated observations plus recorded reward context."""
 
     observations: list[Observation]
-    # cell_capacity_mbps_total recorded by trace rows; None for snapshot data
-    # (the backend's cell_capacity_mbps config knob applies).
-    cell_capacity_mbps: Optional[float] = None
+    # One value per observation. A trace row's capacity describes the reward
+    # transition ending at that row, so step(prev=i, curr=i+1) consumes entry
+    # i+1. None means the backend's configured default applies for that step.
+    cell_capacity_mbps_by_observation: tuple[Optional[float], ...]
 
 
 def _order_value(path: Path, row: dict[str, Any], key: str) -> float:
     try:
         return float(row[key])
     except (TypeError, ValueError) as exc:
+        raise ValueError(f"{path}:{row.get('_lineno', '?')}: non-numeric {key!r} value {row[key]!r}") from exc
+
+
+def _source_iteration(path: Path, row: dict[str, Any]) -> Optional[int]:
+    value = row.get("_source_iter")
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{path}:{row.get('_lineno', '?')}: trace iter must be an integer, not bool")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{path}:{row.get('_lineno', '?')}: non-numeric trace iter {value!r}") from exc
+    if not math.isfinite(numeric) or not numeric.is_integer():
+        raise ValueError(f"{path}:{row.get('_lineno', '?')}: trace iter must be a finite integer, got {value!r}")
+    return int(numeric)
+
+
+def _capacity_value(path: Path, row: dict[str, Any]) -> Optional[float]:
+    value = row.get("cell_capacity_mbps_total")
+    if value is None:
+        return None
+    try:
+        capacity = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{path}:{row.get('_lineno', '?')}: invalid cell_capacity_mbps_total {value!r}") from exc
+    if not math.isfinite(capacity) or capacity <= 0.0:
         raise ValueError(
-            f"{path}:{row.get('_lineno', '?')}: non-numeric {key!r} value {row[key]!r}"
-        ) from exc
+            f"{path}:{row.get('_lineno', '?')}: cell_capacity_mbps_total must be finite and positive, got {value!r}"
+        )
+    return capacity
 
 
 def load_provided_dataset(path: str | Path) -> dict[str, EpisodeSource]:
@@ -434,12 +461,28 @@ def load_provided_dataset(path: str | Path) -> dict[str, EpisodeSource]:
         rows = converted
 
     # Group rows into episodes by 'episode_id' (or 'episode'); a dataset
-    # without one becomes a single episode in file order.
-    # TODO(dataset-schema): trace episode ids are assumed unique across GRPO
-    # iterations; compose the key with 'iter' if provided traces reuse them.
+    # without one becomes a single episode in file order. Preserve legacy keys
+    # when an id occurs in only one iteration, but namespace it when a merged
+    # trace reuses that id across iterations.
+    iterations_by_episode: dict[str, set[Optional[int]]] = {}
+    for row in rows:
+        base_key = str(row.get("episode_id") or row.get("episode") or "episode_0")
+        iterations_by_episode.setdefault(base_key, set()).add(_source_iteration(path, row))
+
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
-        key = str(row.get("episode_id") or row.get("episode") or "episode_0")
+        base_key = str(row.get("episode_id") or row.get("episode") or "episode_0")
+        iterations = iterations_by_episode[base_key]
+        if len(iterations) > 1:
+            iteration = _source_iteration(path, row)
+            if iteration is None:
+                raise ValueError(
+                    f"{path}:{row.get('_lineno', '?')}: episode {base_key!r} spans multiple "
+                    "iterations but one row has no iter field"
+                )
+            key = f"iter_{iteration}::{base_key}"
+        else:
+            key = base_key
         grouped.setdefault(key, []).append(row)
 
     episodes: dict[str, EpisodeSource] = {}
@@ -448,6 +491,9 @@ def load_provided_dataset(path: str | Path) -> dict[str, EpisodeSource]:
         # then file order (stable sort keeps ties in file order).
         if all(r.get("step") is not None for r in group):
             group.sort(key=lambda r: _order_value(path, r, "step"))
+            ordered_steps = [_order_value(path, row, "step") for row in group]
+            if len(ordered_steps) != len(set(ordered_steps)):
+                raise ValueError(f"episode {key!r} contains duplicate step coordinates: {ordered_steps}")
         elif all(r.get("t_s") is not None for r in group):
             group.sort(key=lambda r: _order_value(path, r, "t_s"))
         obs_list: list[Observation] = []
@@ -456,33 +502,24 @@ def load_provided_dataset(path: str | Path) -> dict[str, EpisodeSource]:
                 # Placeholder id, re-stamped at reset() via model_copy.
                 # key[:56] keeps 'src_' + key within the schema's episode_id
                 # max_length=64 for long run names.
-                obs_list.append(
-                    row_to_observation(
-                        row, step_idx=step_idx, episode_id=f"src_{key[:56]}"
-                    )
-                )
+                obs_list.append(row_to_observation(row, step_idx=step_idx, episode_id=f"src_{key[:56]}"))
             # ValueError covers pydantic ValidationError (a subclass) and
             # float('bad'); TypeError covers structurally wrong scalar types
             # like "delivered_mbps": [1, 2] or "t_s": {} hitting float().
             except (TypeError, ValueError) as exc:
                 raise ValueError(
-                    f"{path}:{row.get('_lineno', '?')} (episode {key!r}, "
-                    f"step {step_idx}): {exc}"
+                    f"{path}:{row.get('_lineno', '?')} (episode {key!r}, step {step_idx}): {exc}"
                 ) from exc
         if len(obs_list) < 2:
             raise ValueError(
                 f"episode {key!r} has only {len(obs_list)} row(s); need >= 2 "
                 "observations per episode (each step consumes an obs pair)"
             )
-        capacity = next(
-            (
-                float(r["cell_capacity_mbps_total"])
-                for r in group
-                if r.get("cell_capacity_mbps_total") is not None
-            ),
-            None,
+        capacities = tuple(_capacity_value(path, row) for row in group)
+        episodes[key] = EpisodeSource(
+            observations=obs_list,
+            cell_capacity_mbps_by_observation=capacities,
         )
-        episodes[key] = EpisodeSource(observations=obs_list, cell_capacity_mbps=capacity)
     if not episodes:
         raise ValueError(f"dataset file {path} contains no rows")
     return episodes
@@ -498,8 +535,9 @@ class DatasetEpisode:
     episode_id: str
     meta: EpisodeMeta
     trajectory: list[Observation]
-    # Recorded reward normalizer for trace episodes; None -> the config knob.
-    cell_capacity_mbps: Optional[float] = None
+    cell_capacity_mbps_by_observation: tuple[Optional[float], ...]
+    source_key: str
+    source_index: int
     step_idx: int = 0
     closed: bool = False
     history: list[Any] = field(default_factory=list)  # guardrail.HistoryEntry
@@ -516,6 +554,10 @@ class DatasetReplayBackend(Backend):
     ``rewards.compute_breakdown`` over the served (prev_obs, curr_obs) pair.
     """
 
+    backend_name = "dataset_replay"
+    dynamics_mode = DATASET_DYNAMICS_MODE
+    action_affects_observation = False
+
     def __init__(
         self,
         *,
@@ -523,6 +565,7 @@ class DatasetReplayBackend(Backend):
         pool_size: int = 32,
         max_steps_default: int = 60,
         cell_capacity_mbps: float = 60.0,
+        reward_profile: str = "openair_v1",
         reward_weights: Optional[dict[str, float]] = None,
     ) -> None:
         """
@@ -538,7 +581,8 @@ class DatasetReplayBackend(Backend):
                 term. ReplayEnv gets this from its scenario fingerprint; a
                 recorded dataset has no fingerprint, so it is a config knob
                 (compute_breakdown's own default is 60.0). Trace episodes
-                that record cell_capacity_mbps_total override it per episode.
+                that record cell_capacity_mbps_total override it per transition.
+            reward_profile: Auditable label for the configured reward weights.
             reward_weights: Per-field overrides on rewards.DEFAULT_WEIGHTS.
                 Must match the profile the dataset was recorded under, or
                 recomputed rewards drift from the recorded ones (the
@@ -549,11 +593,12 @@ class DatasetReplayBackend(Backend):
         self.pool_size = int(pool_size)
         self.max_steps_default = int(max_steps_default)
         self.cell_capacity_mbps = float(cell_capacity_mbps)
+        self.reward_profile = str(reward_profile)
+        validate_reward_profile(self.reward_profile, reward_weights)
         self.reward_weights = (
-            replace(_rewards.DEFAULT_WEIGHTS, **reward_weights)
-            if reward_weights
-            else _rewards.DEFAULT_WEIGHTS
+            replace(_rewards.DEFAULT_WEIGHTS, **reward_weights) if reward_weights else _rewards.DEFAULT_WEIGHTS
         )
+        self.reward_weights_dict = asdict(self.reward_weights)
 
         # episode_key -> validated source trajectory (shared read-only across
         # episodes; per-episode copies get their own episode_id stamps).
@@ -568,17 +613,28 @@ class DatasetReplayBackend(Backend):
     def _select_key(self, task_params: dict[str, Any]) -> str:
         """Map task_params onto one recorded episode.
 
-        An explicit 'scenario_id' must match a dataset episode key exactly;
-        otherwise the seed picks deterministically: keys[seed % n].
+        An explicit 'scenario_id' must match a dataset episode key exactly.
+        Otherwise an explicit non-negative ``dataset_index`` selects by
+        modulo; the seed is the backward-compatible final fallback.
         """
         scenario_id = task_params.get("scenario_id")
         if scenario_id is not None:
             key = str(scenario_id)
             if key not in self._sources:
-                raise KeyError(
-                    f"scenario_id {key!r} not in dataset; available: {self._keys}"
-                )
+                raise KeyError(f"scenario_id {key!r} not in dataset; available: {self._keys}")
             return key
+        dataset_index = task_params.get("dataset_index")
+        if dataset_index is not None:
+            if isinstance(dataset_index, bool):
+                raise ValueError("dataset_index must be a non-negative integer, not bool")
+            try:
+                numeric_index = float(dataset_index)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"dataset_index must be a non-negative integer, got {dataset_index!r}") from exc
+            if not math.isfinite(numeric_index) or numeric_index < 0 or not numeric_index.is_integer():
+                raise ValueError(f"dataset_index must be a non-negative integer, got {dataset_index!r}")
+            index = int(numeric_index)
+            return self._keys[index % len(self._keys)]
         seed = int(task_params.get("seed", 0))
         return self._keys[seed % len(self._keys)]
 
@@ -591,6 +647,7 @@ class DatasetReplayBackend(Backend):
         # the lock (and lets a bad scenario_id fail before touching the pool).
         key = self._select_key(task_params)
         source = self._sources[key]
+        source_index = self._keys.index(key)
 
         # Hold the lock across the whole check-reap-build-insert sequence so
         # concurrent resets cannot both pass the capacity check and overshoot
@@ -604,18 +661,14 @@ class DatasetReplayBackend(Backend):
                     self._episodes.pop(eid, None)
             if len(self._episodes) >= self.pool_size:
                 raise RuntimeError(
-                    f"dataset episode pool exhausted ({self.pool_size} live); "
-                    "close episodes or raise pool_size"
+                    f"dataset episode pool exhausted ({self.pool_size} live); close episodes or raise pool_size"
                 )
 
             episode_id = f"ds_{uuid.uuid4().hex[:12]}"
 
             # Re-stamp observations with the real episode id (frozen models:
             # model_copy(update=...), same pattern ReplayEnv uses at reset).
-            trajectory = [
-                obs.model_copy(update={"episode_id": episode_id})
-                for obs in source.observations
-            ]
+            trajectory = [obs.model_copy(update={"episode_id": episode_id}) for obs in source.observations]
 
             # A trajectory of N observations supports N-1 (prev, curr) steps.
             budget = int(task_params.get("max_steps") or self.max_steps_default)
@@ -635,14 +688,14 @@ class DatasetReplayBackend(Backend):
                 episode_id=episode_id,
                 meta=meta,
                 trajectory=trajectory,
-                cell_capacity_mbps=source.cell_capacity_mbps,
+                cell_capacity_mbps_by_observation=source.cell_capacity_mbps_by_observation,
+                source_key=key,
+                source_index=source_index,
             )
             self._episodes[episode_id] = episode
         return first_obs, meta
 
-    def step(
-        self, episode_id: str, tool_call: ToolCall
-    ) -> tuple[Observation, float, bool, dict[str, Any]]:
+    def step(self, episode_id: str, tool_call: ToolCall) -> tuple[Observation, float, bool, dict[str, Any]]:
         with self._lock:
             episode = self._episodes.get(episode_id)
         if episode is None:
@@ -670,15 +723,11 @@ class DatasetReplayBackend(Backend):
             # data, unmodified by the action.
             next_idx = min(episode.step_idx + 1, len(episode.trajectory) - 1)
             new_obs = episode.trajectory[next_idx]
-            episode.step_idx = next_idx
 
-            # Trace episodes carry their recorded capacity (single-cell
-            # reconstruction, so the recorded total is the per-cell value).
-            capacity = (
-                episode.cell_capacity_mbps
-                if episode.cell_capacity_mbps is not None
-                else self.cell_capacity_mbps
-            )
+            # A trace row records the normalizer for the transition ending at
+            # that observation. Missing values use the configured fallback.
+            recorded_capacity = episode.cell_capacity_mbps_by_observation[next_idx]
+            capacity = recorded_capacity if recorded_capacity is not None else self.cell_capacity_mbps
             reward_breakdown = _rewards.compute_breakdown(
                 prev_obs=prev_obs,
                 curr_obs=new_obs,
@@ -688,20 +737,22 @@ class DatasetReplayBackend(Backend):
                 weights=self.reward_weights,
             )
             reward = float(reward_breakdown["total"])
+            if not math.isfinite(reward):
+                raise RuntimeError(f"non-finite dataset reward for episode {episode.source_key!r} step {next_idx}")
+
+            # Commit the state transition only after reward computation and
+            # validation succeeds.
+            episode.step_idx = next_idx
 
             if not rejected:
-                episode.history.append(
-                    _guardrail.HistoryEntry(action=tool_call, t_s=logical_now_s)
-                )
+                episode.history.append(_guardrail.HistoryEntry(action=tool_call, t_s=logical_now_s))
                 if len(episode.history) > 64:
                     episode.history = episode.history[-32:]
 
             # Stamp agent_aux so renderer / SFT / GRPO see the same shape as
             # the other backends.
             aux = AgentAux(
-                last_action=LastActionEcho(
-                    name=tool_call.name, arguments=tool_call.arguments
-                ),
+                last_action=LastActionEcho(name=tool_call.name, arguments=tool_call.arguments),
                 last_reward=reward,
                 last_rejection=gr.reason,
                 step_idx=episode.step_idx,
@@ -716,10 +767,18 @@ class DatasetReplayBackend(Backend):
                 "step_idx": episode.step_idx,
                 "kpi_source": "dataset_replay",
                 "dynamics_mode": DATASET_DYNAMICS_MODE,
+                "action_affects_observation": False,
+                "reward_profile": self.reward_profile,
+                "reward_weights": dict(self.reward_weights_dict),
+                "cell_capacity_mbps": capacity,
+                "cell_capacity_source": (
+                    "recorded_transition" if recorded_capacity is not None else "configured_default"
+                ),
+                "dataset_episode_key": episode.source_key,
+                "dataset_index": episode.source_index,
                 "reward_measurements": reward_breakdown["measurements"],
                 "reward_terms": reward_breakdown["terms"],
             }
-            assert math.isfinite(reward), "reward must be finite"
             return new_obs, reward, done, info
 
     def close(self, episode_id: str) -> dict[str, Any]:
