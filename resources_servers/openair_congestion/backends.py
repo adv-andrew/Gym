@@ -86,6 +86,23 @@ NAMED_REWARD_PROFILE_OVERRIDES: dict[str, dict[str, float]] = {
         "w_buffer": 0.0,
         "w_action": 0.0,
     },
+    # Recorded KPIs are pass-through, so this profile intentionally makes
+    # validity the entire objective: accepted calls score exactly zero and a
+    # rejected call scores exactly -0.5.  Keeping every coefficient explicit
+    # prevents a future RewardWeights default from silently changing that
+    # claim while retaining the same receipt label.
+    "dataset_validity_v1": {
+        "w_sla": 0.0,
+        "w_tput": 0.0,
+        "w_fair": 0.0,
+        "w_buffer": 0.0,
+        "w_sla_level": 0.0,
+        "w_prb_level": 0.0,
+        "w_access_level": 0.0,
+        "w_fair_level": 0.0,
+        "w_action": 0.0,
+        "w_reject": 0.5,
+    },
 }
 
 
@@ -99,10 +116,7 @@ def _replay_action_effect_version() -> str:
     exported = getattr(_replay_env, "ACTION_EFFECT_VERSION", None)
     reporter = getattr(_replay_env, "action_effect_version", None)
     if not isinstance(exported, str) or not exported or exported.strip() != exported:
-        raise RuntimeError(
-            "ReplayEnv must export a non-empty, whitespace-free "
-            "ACTION_EFFECT_VERSION receipt"
-        )
+        raise RuntimeError("ReplayEnv must export a non-empty, whitespace-free ACTION_EFFECT_VERSION receipt")
     if not callable(reporter):
         raise RuntimeError("ReplayEnv must export callable action_effect_version()")
     try:
@@ -110,10 +124,7 @@ def _replay_action_effect_version() -> str:
     except Exception as exc:
         raise RuntimeError("ReplayEnv action_effect_version() receipt failed") from exc
     if not isinstance(reported, str) or not reported or reported.strip() != reported:
-        raise RuntimeError(
-            "ReplayEnv action_effect_version() must return a non-empty, "
-            "whitespace-free string"
-        )
+        raise RuntimeError("ReplayEnv action_effect_version() must return a non-empty, whitespace-free string")
     if reported != exported:
         raise RuntimeError(
             "ReplayEnv action-effect receipt mismatch: "
@@ -179,6 +190,20 @@ class Backend(ABC):
     def episode_receipt_info(self, episode_id: str) -> dict[str, Any]:
         """Return episode-specific provenance for reset receipts, if any."""
         return {}
+
+    def candidate_capacity_mbps_by_cell(
+        self,
+        episode_id: str,
+        observation: Observation,
+    ) -> dict[int, float]:
+        """Return the effective capacity used to derive finite candidates.
+
+        Candidate rendering is opt-in.  Backends must expose the same
+        per-cell capacity that their dynamics/reward path uses rather than
+        allowing the server to guess from tier names or a stale constant.
+        """
+
+        raise RuntimeError(f"backend {self.backend_name!r} does not expose candidate capacity")
 
     @abstractmethod
     def reset(
@@ -276,6 +301,29 @@ class ReplayBackend(Backend):
             max_steps=task_params.get("max_steps"),
         )
 
+    def candidate_capacity_mbps_by_cell(
+        self,
+        episode_id: str,
+        observation: Observation,
+    ) -> dict[int, float]:
+        # ReplayEnv does not yet publish capacity in EpisodeMeta.  Read the
+        # exact fingerprint owned by the installed runtime under its lock;
+        # fail closed if that versioned internal contract disappears instead
+        # of falling back to a guessed 60 Mbps label.
+        lock = getattr(self._env, "_lock", None)
+        episodes = getattr(self._env, "_episodes", None)
+        if lock is None or not isinstance(episodes, dict):
+            raise RuntimeError("installed ReplayEnv does not expose episode capacity")
+        with lock:
+            episode = episodes.get(episode_id)
+            fingerprint = getattr(episode, "fingerprint", None)
+            capacity = getattr(fingerprint, "cell_capacity_mbps", None)
+        try:
+            capacity_value = float(capacity)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError("ReplayEnv episode has invalid cell capacity") from exc
+        return {cell.cell_id: capacity_value for cell in observation.cells}
+
     def _reap_leaked(self, live_episode_ids: set[str]) -> None:
         with self._track_lock:
             leaked = [eid for eid in self._open_episode_ids if eid not in live_episode_ids]
@@ -293,8 +341,7 @@ class ReplayBackend(Backend):
         if runtime_mode != self.dynamics_mode:
             state = "missing" if runtime_mode is None else f"inconsistent ({runtime_mode!r})"
             raise RuntimeError(
-                "ReplayEnv step dynamics_mode receipt is "
-                f"{state}; expected installed runtime {self.dynamics_mode!r}"
+                f"ReplayEnv step dynamics_mode receipt is {state}; expected installed runtime {self.dynamics_mode!r}"
             )
         return observation, reward, terminated, info
 

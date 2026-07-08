@@ -33,6 +33,7 @@ and must be importable in this venv; see the README Setup section.
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 from functools import lru_cache
@@ -52,6 +53,13 @@ from resources_servers.openair_congestion.backends import (
     Backend,
     select_backend,
     validate_reward_profile,
+)
+from resources_servers.openair_congestion.candidate_contract import (
+    RESOURCE_CANDIDATE_CONTRACT,
+    ResourceCandidateSupport,
+    derive_resource_candidate_support,
+    resource_action_key,
+    validate_resource_candidate_guardrail_contract,
 )
 
 
@@ -77,7 +85,11 @@ class RewardWeightOverrides(BaseModel):
     w_reject: Optional[float] = Field(default=None, ge=0.0, allow_inf_nan=False)
 
 
-def _to_resource_compact_pipe_v1(observation: Any) -> str:
+def _to_resource_compact_pipe_v1(
+    observation: Any,
+    *,
+    include_action_instruction: bool = True,
+) -> str:
     """Render the resource server's stable T/C/U/L/A compact contract.
 
     The published resource server supports older packaged telco environments
@@ -115,8 +127,22 @@ def _to_resource_compact_pipe_v1(observation: Any) -> str:
     if aux.last_action is not None:
         arguments = json.dumps(aux.last_action.arguments, sort_keys=True, separators=(",", ":"))
         lines.append(f"L|{aux.last_action.name}|{arguments}|{aux.last_rejection or 'none'}")
-    lines.append("A|one_tool_call_or_noop")
+    if include_action_instruction:
+        lines.append("A|one_tool_call_or_noop")
     return "\n".join(lines)
+
+
+def _to_resource_candidate_pipe_v1(
+    observation: Any,
+    support: ResourceCandidateSupport,
+) -> str:
+    """Render compact KPIs plus independently authenticated finite support."""
+
+    base = _to_resource_compact_pipe_v1(
+        observation,
+        include_action_instruction=False,
+    )
+    return "\n".join([base, *support.render_rows()])
 
 
 @lru_cache(maxsize=1)
@@ -157,11 +183,17 @@ class OpenAirCongestionResourcesServerConfig(BaseResourcesServerConfig):
     # normalizer; trace episodes recording cell_capacity_mbps_total override it.
     dataset_path: str = Field(default="data/dataset/provided.jsonl", min_length=1)
     cell_capacity_mbps: float = Field(default=60.0, gt=0.0, allow_inf_nan=False)
-    reward_profile: Literal["openair_v1", "openair_v2_measured", "custom"] = "openair_v1"
+    reward_profile: Literal[
+        "openair_v1",
+        "openair_v2_measured",
+        "dataset_validity_v1",
+        "custom",
+    ] = "openair_v1"
     reward_weights: Optional[RewardWeightOverrides] = None
     observation_render: Literal[
         "verbose_v1",
         "resource_compact_pipe_v1",
+        "resource_candidate_pipe_v1",
         "t2_compact_pipe_v2",
     ] = "verbose_v1"
     # Truncation-budget fallback for task rows that omit max_steps. Must not
@@ -204,6 +236,7 @@ class OpenAirCongestionEnv(GymnasiumServer):
     # Backend built once at startup so a bad replay_root / unknown backend
     # name fails at boot, not on the first rollout. Pydantic private attr.
     _backend: Optional[Backend] = None
+    _candidate_guardrail_contract: Optional[dict[str, Any]] = None
 
     def model_post_init(self, __context: Any) -> None:
         super().model_post_init(__context)
@@ -211,6 +244,10 @@ class OpenAirCongestionEnv(GymnasiumServer):
             # Resolve at boot, not on the first rollout, so a stale telco env
             # cannot advertise the qualified T2 contract and fail mid-run.
             _load_t2_compact_renderer()
+        if self.config.observation_render == RESOURCE_CANDIDATE_CONTRACT:
+            self._candidate_guardrail_contract = (
+                validate_resource_candidate_guardrail_contract()
+            )
         self._backend = select_backend(self.config)
 
     @property
@@ -223,18 +260,22 @@ class OpenAirCongestionEnv(GymnasiumServer):
         return {state["episode_id"] for state in self.session_state.values()}
 
     def _backend_receipt_info(self) -> dict[str, Any]:
-        return {
+        receipt = {
             **self.backend.receipt_info(),
             "observation_render": self.config.observation_render,
         }
+        if self.config.observation_render == RESOURCE_CANDIDATE_CONTRACT:
+            receipt["candidate_contract"] = RESOURCE_CANDIDATE_CONTRACT
+            receipt["candidate_guardrail_contract"] = copy.deepcopy(
+                self._candidate_guardrail_contract
+            )
+        return receipt
 
     @staticmethod
     def _merge_receipt_info(target: dict[str, Any], receipt: dict[str, Any], *, source: str) -> None:
         """Merge immutable receipt fields without hiding runtime conflicts."""
         conflicts = {
-            key: (target[key], value)
-            for key, value in receipt.items()
-            if key in target and target[key] != value
+            key: (target[key], value) for key, value in receipt.items() if key in target and target[key] != value
         }
         if conflicts:
             details = ", ".join(
@@ -255,9 +296,60 @@ class OpenAirCongestionEnv(GymnasiumServer):
             source="backend runtime",
         )
 
-    def _render_observation(self, observation: Any) -> str:
+    @staticmethod
+    def _recent_excluded_actions(state: dict[str, Any]) -> list[ToolCall]:
+        """Actions still inside the shared guardrail's two-step window."""
+
+        current_step = int(state["agent_steps"])
+        recent = [
+            entry for entry in state.get("recent_accepted_actions", []) if current_step - int(entry["agent_step"]) < 2
+        ]
+        state["recent_accepted_actions"] = recent
+        return [entry["action"] for entry in recent]
+
+    @staticmethod
+    def _seed_recent_actions(observation: Any) -> list[dict[str, Any]]:
+        """Honor accepted action history surfaced by recorded trace row zero."""
+
+        aux = observation.agent_aux
+        last = aux.last_action
+        if last is None or aux.last_rejection is not None or last.name == "noop":
+            return []
+        try:
+            action = ToolCall(name=last.name, arguments=dict(last.arguments))
+        except ValueError:
+            # A malformed historical echo is dataset provenance, not a safe
+            # action.  It cannot be repeated through the finite contract.
+            return []
+        return [{"action": action, "agent_step": 0}]
+
+    def _candidate_support(
+        self,
+        observation: Any,
+        state: dict[str, Any],
+    ) -> ResourceCandidateSupport:
+        capacity = self.backend.candidate_capacity_mbps_by_cell(
+            state["episode_id"],
+            observation,
+        )
+        return derive_resource_candidate_support(
+            observation,
+            capacity_mbps_by_cell=capacity,
+            excluded_actions=self._recent_excluded_actions(state),
+        )
+
+    def _render_observation(
+        self,
+        observation: Any,
+        *,
+        candidate_support: Optional[ResourceCandidateSupport] = None,
+    ) -> str:
         if self.config.observation_render == "resource_compact_pipe_v1":
             return _to_resource_compact_pipe_v1(observation)
+        if self.config.observation_render == RESOURCE_CANDIDATE_CONTRACT:
+            if candidate_support is None:
+                raise RuntimeError("candidate render requires authenticated support")
+            return _to_resource_candidate_pipe_v1(observation, candidate_support)
         if self.config.observation_render == "t2_compact_pipe_v2":
             return _load_t2_compact_renderer()(observation)
         return to_user_text(observation)
@@ -333,7 +425,13 @@ class OpenAirCongestionEnv(GymnasiumServer):
             # Cap at the agent's turn budget so the server truncates no later
             # than the agent and the episode slot is freed via close_session().
             "max_agent_steps": max_agent_steps,
+            "recent_accepted_actions": self._seed_recent_actions(first_obs),
         }
+        state = self.session_state[session_id]
+        candidate_support: Optional[ResourceCandidateSupport] = None
+        if self.config.observation_render == RESOURCE_CANDIDATE_CONTRACT:
+            candidate_support = self._candidate_support(first_obs, state)
+            state["candidate_support"] = candidate_support
         # Observation appended as a user message after the dataset prompt.
         reset_info = {
             "episode_id": meta.episode_id,
@@ -348,7 +446,19 @@ class OpenAirCongestionEnv(GymnasiumServer):
             self.backend.episode_receipt_info(meta.episode_id),
             source="backend episode",
         )
-        return self._render_observation(first_obs), reset_info
+        if candidate_support is not None:
+            self._merge_receipt_info(
+                reset_info,
+                candidate_support.receipt_fields(),
+                source="candidate support",
+            )
+        return (
+            self._render_observation(
+                first_obs,
+                candidate_support=candidate_support,
+            ),
+            reset_info,
+        )
 
     async def step(
         self, action: NeMoGymResponse, metadata: dict, session_id: Optional[str] = None
@@ -405,6 +515,28 @@ class OpenAirCongestionEnv(GymnasiumServer):
                 ]
                 tool_call = ToolCall(name="set_scheduler_policy", arguments={})
 
+        submitted_support: Optional[ResourceCandidateSupport] = state.get("candidate_support")
+        submitted_candidate_supported: Optional[bool] = None
+        if submitted_support is not None:
+            submitted_key = resource_action_key(tool_call)
+            submitted_candidate_supported = any(
+                resource_action_key(candidate) == submitted_key
+                for candidate in submitted_support.actions
+            )
+            if protocol_error is None and not submitted_candidate_supported:
+                assert call is not None
+                protocol_error = "candidate_support_violation"
+                protocol_error_detail = "tool call is not a member of the authenticated resource candidate support"
+                tool_outputs = [
+                    self.tool_output(
+                        call,
+                        {"accepted": False, "error": protocol_error_detail},
+                    )
+                ]
+                # Consume the transition and charge the configured rejection
+                # exactly as every other malformed policy turn does.
+                tool_call = ToolCall(name="set_scheduler_policy", arguments={})
+
         # One env step. In-range-but-rejected actions (guardrail) come back as
         # accepted=False with the env's own penalty reward, never an exception.
         next_obs, reward, done, step_info = self.backend.step(state["episode_id"], tool_call)
@@ -448,9 +580,41 @@ class OpenAirCongestionEnv(GymnasiumServer):
                 )
             )
 
+        if (
+            submitted_support is not None
+            and submitted_candidate_supported is True
+            and protocol_error is None
+            and not accepted
+        ):
+            # Emitted support is a server promise.  Continuing after a
+            # candidate is unexpectedly rejected would contaminate a RunB2
+            # validity/decision receipt, so end the episode and fail closed.
+            await self.close_session(session_id)
+            raise RuntimeError(
+                f"authenticated resource candidate was rejected by backend: {rejection_reason or 'reason unavailable'}"
+            )
+
+        if accepted and protocol_error is None and tool_call.name != "noop":
+            state["recent_accepted_actions"].append(
+                {
+                    "action": tool_call,
+                    "agent_step": state["agent_steps"],
+                }
+            )
+
         terminated = bool(done)
         truncated = (not terminated) and out_of_budget
-        observation = None if (terminated or truncated) else self._render_observation(next_obs)
+        next_candidate_support: Optional[ResourceCandidateSupport] = None
+        if terminated or truncated:
+            observation = None
+        else:
+            if submitted_support is not None:
+                next_candidate_support = self._candidate_support(next_obs, state)
+                state["candidate_support"] = next_candidate_support
+            observation = self._render_observation(
+                next_obs,
+                candidate_support=next_candidate_support,
+            )
 
         response_info = dict(step_info)
         response_info.update(
@@ -465,6 +629,20 @@ class OpenAirCongestionEnv(GymnasiumServer):
             }
         )
         self._merge_backend_receipt_info(response_info)
+        if submitted_support is not None:
+            response_info.update(
+                {
+                    "submitted_candidate_contract": submitted_support.contract,
+                    "submitted_candidate_support_sha256": submitted_support.support_sha256,
+                    "submitted_candidate_supported": submitted_candidate_supported,
+                }
+            )
+        if next_candidate_support is not None:
+            self._merge_receipt_info(
+                response_info,
+                next_candidate_support.receipt_fields(),
+                source="next candidate support",
+            )
         if protocol_error is not None:
             response_info.update(
                 {

@@ -63,7 +63,7 @@ One JSON object per line; one line is one timestep of one episode. Rows sharing 
 | `t_s` | no | Timestamp in seconds |
 | `kpi_source_mode` | no | Default `replay` stamps synthesized fields as synthetic; set e.g. `runner_snapshot` for lab-measured data |
 
-Optional per cell: `prb_util_dl_p99`, `prb_util_ul_p50`, `sched_latency_ms_p99`, `rrc_connected_ues`, `prach_collision_rate`, `fairness_jain`, `sla_violations_last_window`. Optional per UE: `offered_mbps`, `bler`, `sinr_db`, `mcs_mean`, `buffer_occupancy_kb`, `pdb_violations`, `5qi` (alias `qos_5qi`). Provided values pass through unchanged (clamped to schema bounds); missing values are synthesized with the same heuristics the live env uses (`env.py::_build_observation`), so a sparse dataset still yields the full training shape.
+Optional per cell: `prb_util_dl_p99`, `prb_util_ul_p50`, `sched_latency_ms_p99`, `rrc_connected_ues`, `prach_collision_rate`, `fairness_jain`, `sla_violations_last_window`. Optional per UE: `offered_mbps`, `requested_mbps`, `admitted_mbps`, `prb_cap_max_prb`, `bler`, `sinr_db`, `mcs_mean`, `buffer_occupancy_kb`, `pdb_violations`, `5qi` (alias `qos_5qi`). Provided values pass through unchanged (clamped to schema bounds); missing values are synthesized with the same heuristics the live env uses (`env.py::_build_observation`), so a sparse dataset still yields the full training shape.
 
 A minimal row:
 
@@ -138,12 +138,26 @@ No model server or API key is needed when a local trainer owns generation. The s
 python -m resources_servers.openair_congestion.serve \
   --backend dataset_replay \
   --dataset-path /absolute/path/to/train.jsonl \
-  --reward-profile openair_v2_measured \
-  --observation-render resource_compact_pipe_v1 \
+  --reward-profile dataset_validity_v1 \
+  --observation-render resource_candidate_pipe_v1 \
   --max-steps 12 --pool-size 64 --port 9110
 ```
 
-Use `--backend replay --port 9111` for an action-responsive synthetic comparison. Three observation contracts are explicit: `verbose_v1`; `resource_compact_pipe_v1`, the truthful T/C/U/L/A resource form and standalone default; and strict `t2_compact_pipe_v2`, which delegates to the qualified telco renderer and includes P/D rows. Aggregate traces do not contain the capacity/candidate state needed for truthful P/D rows, so dataset replay must use the resource form. Selecting strict T2 fails at server startup when the installed telco package lacks that renderer; use it only with a real T2 observation source. The catalog YAML retains the verbose form. The `/reset` and `/step` responses expose backend/dynamics semantics, the selected render, effective reward weights, and (for datasets) SHA-256 identity, row/episode counts, reconstruction schema/topology/assumptions, transition capacity, and dataset key/index.
+Use `--backend replay --port 9111` for an action-responsive synthetic comparison. Four observation contracts are explicit: `verbose_v1`; `resource_compact_pipe_v1`, the truthful T/C/U/L/A resource form and standalone default; `resource_candidate_pipe_v1`, the RunB2 finite-support form described below; and strict `t2_compact_pipe_v2`, which delegates to the qualified telco renderer and includes P/D rows. Aggregate traces do not contain the connected-T2 state needed for truthful P/D rows, so dataset replay must use one of the resource forms. Selecting strict T2 fails at server startup when the installed telco package lacks that renderer; use it only with a real T2 observation source. The catalog YAML retains the verbose form. The `/reset` and `/step` responses expose backend/dynamics semantics, the selected render, effective reward weights, and (for datasets) SHA-256 identity, row/episode counts, reconstruction schema/topology/assumptions, transition capacity, and dataset key/index.
+
+`resource_candidate_pipe_v1` appends authenticated finite support to each compact observation:
+
+```text
+RCP|resource_candidate_pipe_v1|<sha256>|<action_count>
+RCC|<cell_id>|<capacity_milli_mbps>
+RCA|0|{"arguments":{},"name":"noop"}
+RCA|1|{"arguments":{"cell_id":0,"max_prb":220,"target":"ue","target_id":7},"name":"set_prb_cap"}
+A|choose_exactly_one_resource_candidate
+```
+
+The SHA-256 is over compact sorted JSON with the exact keys `contract`, `capacity_milli_mbps_by_cell`, and `actions`. It authenticates the action menu and current-state capacities, not the preceding T/C/U/L KPI text. Capacity comes from the backend's current episode, not a tier-name guess. Candidates preserve visible UE IDs (including sparse or globally numbered IDs), include `noop` plus at most one canonical release/cap per cell, omit equal active setpoints, and omit accepted actions still inside the two-step repeat window. At server boot, a `resource_candidate_guardrail_probe_v1` receipt verifies the installed telco guardrail still accepts the declared cap/release endpoints, has no blanket setpoint cooldown, and enforces the same two-step identical-repeat window. Reset receipts expose `candidate_*` fields; step receipts bind the submitted action to `submitted_candidate_support_sha256` and, on nonterminal steps, expose the next observation's support. A support member rejected by the backend is a fatal server-contract error.
+
+`dataset_validity_v1` is sealed to zero for every KPI and action coefficient and `w_reject=0.5`. Therefore an accepted transition is exactly `0.0` and a rejected transition is exactly `-0.5`; this profile supports the narrow claim that a policy learned valid tool use on pass-through data. It cannot support a congestion-relief claim.
 
 Malformed, missing, or multiple tool calls consume one transition and receive the backend's ordinary guardrail-rejection penalty. This closes the shortcut where a policy could skip a negative recorded KPI transition by emitting no valid call.
 

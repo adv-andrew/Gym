@@ -38,6 +38,26 @@ def test_named_measured_profile_builds_sealed_validated_config():
     assert config.observation_render == "resource_compact_pipe_v1"
 
 
+def test_validity_profile_and_candidate_contract_build_sealed_config():
+    args = serve.build_parser().parse_args(
+        [
+            "--backend",
+            "dataset_replay",
+            "--reward-profile",
+            "dataset_validity_v1",
+            "--observation-render",
+            "resource_candidate_pipe_v1",
+        ]
+    )
+    config = serve.config_from_args(args)
+    weights = config.reward_weights.model_dump(exclude_none=True)
+
+    assert config.reward_profile == "dataset_validity_v1"
+    assert config.observation_render == "resource_candidate_pipe_v1"
+    assert weights["w_reject"] == 0.5
+    assert all(value == 0.0 for name, value in weights.items() if name != "w_reject")
+
+
 def test_custom_profile_requires_explicit_weights():
     args = serve.build_parser().parse_args(["--reward-profile", "custom"])
     with pytest.raises(ValueError, match="requires"):

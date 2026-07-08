@@ -57,7 +57,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cell-capacity-mbps", type=float, default=60.0)
     parser.add_argument(
         "--observation-render",
-        choices=("verbose_v1", "resource_compact_pipe_v1", "t2_compact_pipe_v2"),
+        choices=(
+            "verbose_v1",
+            "resource_compact_pipe_v1",
+            "resource_candidate_pipe_v1",
+            "t2_compact_pipe_v2",
+        ),
         default="resource_compact_pipe_v1",
         help=(
             "Policy observation representation. Dataset GRPO defaults to the "

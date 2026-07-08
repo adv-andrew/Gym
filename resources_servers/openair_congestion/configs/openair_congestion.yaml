@@ -33,6 +33,7 @@ openair_congestion:
       agent_max_steps: 16
       # Existing Gym/model-server flows retain the verbose representation.
       # The standalone dataset-GRPO launcher defaults to resource_compact_pipe_v1;
+      # RunB2 uses resource_candidate_pipe_v1 for authenticated finite support;
       # strict t2_compact_pipe_v2 requires the newer telco package and T2 state.
       observation_render: verbose_v1
       # dataset_replay knobs — flip `backend: dataset_replay` and point
@@ -50,6 +51,8 @@ openair_congestion:
       # reward_weights must match the profile the dataset was recorded under;
       # openair_v2_measured runs zero the synthetic-proxy terms:
       # reward_weights: {w_sla: 0.0, w_sla_level: 0.0, w_buffer: 0.0, w_action: 0.0}
+      # dataset_validity_v1 instead seals every KPI/action coefficient to zero
+      # and w_reject to 0.5, so accepted/rejected rewards are exactly 0/-0.5.
       #
       # oai_collector knobs (all forwarded by select_backend; unused until the
       # live wiring lands — see backends.py OAICollectorBackend docstring):

@@ -239,28 +239,68 @@ def _num(raw: dict[str, Any], key: str, default: float) -> float:
     return float(value)
 
 
+def _finite_nonnegative_number(raw: dict[str, Any], key: str, default: float) -> float:
+    value = raw.get(key)
+    if value is None:
+        value = default
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+        or float(value) < 0.0
+    ):
+        raise ValueError(f"dataset UE field {key!r} must be a finite nonnegative number")
+    return float(value)
+
+
 def _parse_ue(raw: dict[str, Any], ue_idx: int) -> dict[str, Any]:
     """Parse one UE record; synthesize any missing optional field.
 
     ``delivered_mbps`` is required; everything else falls back to the env's
     defaults (sinr=10.0, bler=0.0) or derivation heuristics.
     """
-    if "delivered_mbps" not in raw:
+    if "delivered_mbps" not in raw or raw["delivered_mbps"] is None:
         raise ValueError(
             f"dataset UE record #{ue_idx} is missing required field 'delivered_mbps'; got keys {sorted(raw)}"
         )
-    delivered = max(0.0, float(raw["delivered_mbps"]))
-    offered = max(0.0, _num(raw, "offered_mbps", max(delivered, 1.0)))
+    delivered = _finite_nonnegative_number(raw, "delivered_mbps", 0.0)
+    offered = _finite_nonnegative_number(
+        raw,
+        "offered_mbps",
+        max(delivered, 1.0),
+    )
+    requested = _finite_nonnegative_number(raw, "requested_mbps", offered)
+    admitted = _finite_nonnegative_number(raw, "admitted_mbps", offered)
+    raw_cap = raw.get("prb_cap_max_prb")
+    if raw_cap is None:
+        prb_cap_max_prb = None
+    elif (
+        not isinstance(raw_cap, int)
+        or isinstance(raw_cap, bool)
+        or not 0 <= raw_cap <= 273
+    ):
+        raise ValueError(
+            "dataset UE field 'prb_cap_max_prb' must be an integer in [0,273] or null"
+        )
+    else:
+        prb_cap_max_prb = raw_cap
     sinr = min(40.0, max(-20.0, _num(raw, "sinr_db", 10.0)))
     bler = min(1.0, max(0.0, _num(raw, "bler", 0.0)))
     # env.py heuristics: mcs from SINR, backlog from offered - delivered,
     # PDB violation when backlog exceeds 500 kB.
     mcs_mean = _num(raw, "mcs_mean", max(0.0, min(27.0, (max(sinr, -10.0) + 5.0) * 1.2)))
-    buffer_kb = max(0.0, _num(raw, "buffer_occupancy_kb", max(0.0, (offered - delivered) * 50.0)))
+    buffer_kb = _finite_nonnegative_number(
+        raw,
+        "buffer_occupancy_kb",
+        max(0.0, (offered - delivered) * 50.0),
+    )
     pdb = int(_num(raw, "pdb_violations", 1 if buffer_kb > 500.0 else 0))
     return {
         "ue_id": int(raw.get("ue_id", ue_idx)),
         "offered_mbps": offered,
+        "requested_mbps": requested,
+        "admitted_mbps": admitted,
+        "prb_cap_max_prb": prb_cap_max_prb,
         "delivered_mbps": delivered,
         "bler": bler,
         "mcs_mean": max(0.0, min(27.0, mcs_mean)),
@@ -908,6 +948,25 @@ class DatasetReplayBackend(Backend):
             **self._reconstruction_receipt(episode, episode.trajectory[episode.step_idx]),
         }
 
+    def candidate_capacity_mbps_by_cell(
+        self,
+        episode_id: str,
+        observation: Observation,
+    ) -> dict[int, float]:
+        """Return the transition normalizer represented by this observation."""
+
+        with self._lock:
+            episode = self._episodes.get(episode_id)
+        if episode is None:
+            raise KeyError(f"unknown episode_id {episode_id!r}")
+        with episode.lock:
+            recorded_capacity_total = episode.cell_capacity_mbps_by_observation[episode.step_idx]
+            n_cells = max(1, observation.global_.n_cells)
+            capacity_per_cell = (
+                recorded_capacity_total / n_cells if recorded_capacity_total is not None else self.cell_capacity_mbps
+            )
+        return {cell.cell_id: float(capacity_per_cell) for cell in observation.cells}
+
     # --- episode selection ----------------------------------------------------
 
     def _select_key(self, task_params: dict[str, Any]) -> str:
@@ -1045,16 +1104,67 @@ class DatasetReplayBackend(Backend):
             prev_obs = episode.trajectory[episode.step_idx]
             logical_now_s = float(episode.step_idx + 1)
 
+            visible_cell_ids = {cell.cell_id for cell in prev_obs.cells}
+            raw_cell_id = tool_call.arguments.get("cell_id")
+            exact_topology_rejection: str | None = None
+            if tool_call.name != "noop" and (
+                not isinstance(raw_cell_id, int)
+                or isinstance(raw_cell_id, bool)
+                or raw_cell_id not in visible_cell_ids
+            ):
+                exact_topology_rejection = (
+                    f"{tool_call.name}: cell_id={raw_cell_id!r} is not a "
+                    f"visible cell id {sorted(visible_cell_ids)}"
+                )
+            elif (
+                tool_call.name == "set_prb_cap"
+                and tool_call.arguments.get("target") == "ue"
+            ):
+                raw_target_id = tool_call.arguments.get("target_id")
+                visible_ue_ids = {
+                    ue.ue_id
+                    for cell in prev_obs.cells
+                    if cell.cell_id == raw_cell_id
+                    for ue in cell.ues
+                }
+                if (
+                    not isinstance(raw_target_id, int)
+                    or isinstance(raw_target_id, bool)
+                    or raw_target_id not in visible_ue_ids
+                ):
+                    exact_topology_rejection = (
+                        "set_prb_cap: "
+                        f"target_id={raw_target_id!r} is not a visible UE id "
+                        f"for cell {raw_cell_id!r}: {sorted(visible_ue_ids)}"
+                    )
+
             # Same guardrail as ReplayEnv.step, fed from the observation
             # itself (a recorded dataset has no scenario fingerprint).
-            gr = _guardrail.check(
-                tool_call,
-                history=episode.history,
-                n_cells=max(1, prev_obs.global_.n_cells),
-                n_ues=max(1, prev_obs.global_.n_ues_total),
-                n_ues_by_cell={c.cell_id: len(c.ues) for c in prev_obs.cells},
-                now_s=logical_now_s,
-            )
+            if exact_topology_rejection is not None:
+                gr = _guardrail.GuardrailResult(
+                    accepted=False,
+                    reason=exact_topology_rejection,
+                )
+            else:
+                gr = _guardrail.check(
+                    tool_call,
+                    history=episode.history,
+                    # Cell identifiers can be sparse/global.  The exact-set
+                    # precheck above prevents holes from becoming valid while
+                    # this upper bound keeps a visible nonzero ID admissible.
+                    n_cells=max(visible_cell_ids, default=0) + 1,
+                    n_ues=max(1, prev_obs.global_.n_ues_total),
+                    # The exact-set precheck handles UE membership.  The
+                    # shared guardrail still needs an upper bound for its
+                    # numeric range check.
+                    n_ues_by_cell={
+                        cell.cell_id: (
+                            max((ue.ue_id for ue in cell.ues), default=-1) + 1
+                        )
+                        for cell in prev_obs.cells
+                    },
+                    now_s=logical_now_s,
+                )
             rejected = not gr.accepted
 
             # Pass-through dynamics: the next observation is the recorded
