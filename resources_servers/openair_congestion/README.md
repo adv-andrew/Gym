@@ -143,7 +143,7 @@ python -m resources_servers.openair_congestion.serve \
   --max-steps 12 --pool-size 64 --port 9110
 ```
 
-Use `--backend replay --port 9111` for an action-responsive synthetic comparison. `verbose_v1` and `t2_compact_pipe_v2` are explicit observation-render choices; the standalone launcher defaults to the compact form while the catalog YAML retains the verbose form. The `/reset` and `/step` responses expose backend/dynamics semantics, the selected render, effective reward weights, and (for datasets) SHA-256 identity, row/episode counts, reconstruction schema/topology/assumptions, transition capacity, and dataset key/index.
+Use `--backend replay --port 9111` for an action-responsive synthetic comparison. `verbose_v1` and `t2_compact_pipe_v2` are explicit observation-render choices; the standalone launcher defaults to the compact form while the catalog YAML retains the verbose form. On this resource surface the compact representation is the truthful T/C/U/L/A subset: aggregate traces do not contain the capacity/candidate state needed for T2 P/D rows, so the server does not fabricate them. The `/reset` and `/step` responses expose backend/dynamics semantics, the selected render, effective reward weights, and (for datasets) SHA-256 identity, row/episode counts, reconstruction schema/topology/assumptions, transition capacity, and dataset key/index.
 
 Malformed, missing, or multiple tool calls consume one transition and receive the backend's ordinary guardrail-rejection penalty. This closes the shortcut where a policy could skip a negative recorded KPI transition by emitting no valid call.
 
