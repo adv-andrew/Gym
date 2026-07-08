@@ -55,7 +55,7 @@ from resources_servers.openair_congestion.backends import (
 
 
 # isort: split
-from openair_congestion.render import to_compact_user_text, to_user_text
+from openair_congestion.render import to_user_text
 from openair_congestion.schemas import AgentAux, LastActionEcho, ToolCall
 
 
@@ -74,6 +74,48 @@ class RewardWeightOverrides(BaseModel):
     w_fair_level: Optional[float] = Field(default=None, ge=0.0, allow_inf_nan=False)
     w_action: Optional[float] = Field(default=None, ge=0.0, allow_inf_nan=False)
     w_reject: Optional[float] = Field(default=None, ge=0.0, allow_inf_nan=False)
+
+
+def _to_compact_pipe_v2(observation: Any) -> str:
+    """Render the stable T/C/U/L/A subset of the T2 compact pipe contract.
+
+    The published resource server supports older packaged telco environments
+    that predate the T2 policy-feature module. Aggregate dataset traces also do
+    not contain the capacity/candidate state needed to truthfully synthesize P
+    or D rows, so those rows are deliberately omitted rather than fabricated.
+    """
+    global_obs = observation.global_
+    lines = [
+        f"T|{observation.t_s:.1f}|{observation.agent_aux.step_idx}|{global_obs.tier}|{observation.kpi_source_mode}"
+    ]
+    for cell in observation.cells:
+        lines.append(
+            f"C|{cell.cell_id}|{cell.prb_util_dl_p50:.3f}|"
+            f"{cell.prb_util_dl_p99:.3f}|{cell.prb_util_ul_p50:.3f}|"
+            f"{cell.sched_latency_ms_p99:.1f}|{cell.fairness_jain:.3f}|"
+            f"{cell.prach_collision_rate:.3f}|{cell.rrc_connected_ues}|"
+            f"{cell.sla_violations_last_window}"
+        )
+        for ue in cell.ues:
+            requested = getattr(ue, "requested_mbps", None)
+            admitted = getattr(ue, "admitted_mbps", None)
+            max_prb = getattr(ue, "prb_cap_max_prb", None)
+            requested = ue.offered_mbps if requested is None else requested
+            admitted = ue.offered_mbps if admitted is None else admitted
+            max_prb = 273 if max_prb is None else max_prb
+            lines.append(
+                f"U|{cell.cell_id}/{ue.ue_id}|{ue.qos_5qi}|"
+                f"{requested:.3f}|{admitted:.3f}|{ue.delivered_mbps:.3f}|"
+                f"{'on' if max_prb < 273 else 'off'}|{max_prb}|"
+                f"{ue.sinr_db:.2f}|{ue.bler:.3f}|{ue.mcs_mean:.1f}|"
+                f"{ue.buffer_occupancy_kb:.1f}|{ue.pdb_violations}"
+            )
+    aux = observation.agent_aux
+    if aux.last_action is not None:
+        arguments = json.dumps(aux.last_action.arguments, sort_keys=True, separators=(",", ":"))
+        lines.append(f"L|{aux.last_action.name}|{arguments}|{aux.last_rejection or 'none'}")
+    lines.append("A|one_tool_call_or_noop")
+    return "\n".join(lines)
 
 
 class OpenAirCongestionResourcesServerConfig(BaseResourcesServerConfig):
@@ -154,7 +196,7 @@ class OpenAirCongestionEnv(GymnasiumServer):
 
     def _render_observation(self, observation: Any) -> str:
         if self.config.observation_render == "t2_compact_pipe_v2":
-            return to_compact_user_text(observation)
+            return _to_compact_pipe_v2(observation)
         return to_user_text(observation)
 
     def setup_webserver(self) -> FastAPI:
