@@ -42,6 +42,8 @@ openair = pytest.importorskip(
     reason="telco env package 'openair_congestion' not installed; see README Setup",
 )
 
+from openair_congestion.replay_env import action_effect_version  # noqa: E402
+
 from resources_servers.openair_congestion.app import (  # noqa: E402
     OpenAirCongestionEnv,
     OpenAirCongestionResourcesServerConfig,
@@ -205,11 +207,36 @@ class TestReset:
         env = _make_env()
         _, info = await env.reset(dict(_TASK_METADATA), session_id="sid")
         assert info["backend"] == "replay"
-        assert info["dynamics_mode"] == "synthetic_action_effect_v1"
+        assert info["dynamics_mode"] == action_effect_version()
         assert info["action_affects_observation"] is True
         assert info["reward_profile"] == "env_default"
         assert info["reward_weights"]["w_reject"] > 0.0
         assert info["observation_render"] == "verbose_v1"
+
+    def test_replay_backend_fails_closed_on_inconsistent_version_exports(self, monkeypatch):
+        import resources_servers.openair_congestion.backends as backends_module
+
+        monkeypatch.setattr(
+            backends_module._replay_env,
+            "action_effect_version",
+            lambda: f"{backends_module._replay_env.ACTION_EFFECT_VERSION}_stale",
+        )
+        with pytest.raises(RuntimeError, match="action-effect receipt mismatch"):
+            ReplayBackend()
+
+    def test_replay_backend_fails_closed_on_missing_version_export(self, monkeypatch):
+        import resources_servers.openair_congestion.backends as backends_module
+
+        monkeypatch.delattr(backends_module._replay_env, "ACTION_EFFECT_VERSION")
+        with pytest.raises(RuntimeError, match="ACTION_EFFECT_VERSION"):
+            ReplayBackend()
+
+    def test_replay_backend_fails_closed_on_missing_version_reporter(self, monkeypatch):
+        import resources_servers.openair_congestion.backends as backends_module
+
+        monkeypatch.delattr(backends_module._replay_env, "action_effect_version")
+        with pytest.raises(RuntimeError, match=r"callable action_effect_version\(\)"):
+            ReplayBackend()
 
     @pytest.mark.asyncio
     async def test_resource_compact_observation_render_is_selected_and_stamped(self):
@@ -241,9 +268,47 @@ class TestStep:
         assert trunc is False
         assert "5G RAN telemetry" in obs
         assert info["guardrail_accepted"] is True
+        assert info["dynamics_mode"] == action_effect_version()
         # The applied call gets a matching function_call_output for the agent.
         assert info["tool_outputs"][0]["call_id"] == "call_0"
         assert env.session_state["sid"]["n_steps"] == 1
+
+    @pytest.mark.asyncio
+    async def test_replay_backend_rejects_missing_runtime_dynamics_receipt(self, monkeypatch):
+        env = _make_env()
+        await env.reset(dict(_TASK_METADATA), session_id="sid")
+        backend = env.backend
+        assert isinstance(backend, ReplayBackend)
+        original_step = backend._env.step
+
+        def step_without_receipt(*args, **kwargs):
+            observation, reward, terminated, info = original_step(*args, **kwargs)
+            info = dict(info)
+            info.pop("dynamics_mode", None)
+            return observation, reward, terminated, info
+
+        monkeypatch.setattr(backend._env, "step", step_without_receipt)
+        with pytest.raises(RuntimeError, match="step dynamics_mode receipt is missing"):
+            await env.step(_tool_response("noop", {}), {}, session_id="sid")
+
+    @pytest.mark.asyncio
+    async def test_app_rejects_runtime_receipt_conflict_instead_of_overwriting(self, monkeypatch):
+        env = _make_env()
+        await env.reset(dict(_TASK_METADATA), session_id="sid")
+        backend = env.backend
+        assert isinstance(backend, ReplayBackend)
+
+        # Bypass ReplayBackend.step's own check to prove the app-level merge is
+        # independently fail-closed and cannot mask a real runtime receipt.
+        def unvalidated_step(episode_id, tool_call):
+            observation, reward, terminated, info = backend._env.step(episode_id, tool_call)
+            info = dict(info)
+            info["dynamics_mode"] = f"{action_effect_version()}_contradiction"
+            return observation, reward, terminated, info
+
+        monkeypatch.setattr(backend, "step", unvalidated_step)
+        with pytest.raises(RuntimeError, match="backend runtime receipt conflict"):
+            await env.step(_tool_response("noop", {}), {}, session_id="sid")
 
     @pytest.mark.asyncio
     async def test_out_of_range_action_is_rejected_not_crashed(self):

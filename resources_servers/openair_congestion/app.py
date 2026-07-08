@@ -228,6 +228,33 @@ class OpenAirCongestionEnv(GymnasiumServer):
             "observation_render": self.config.observation_render,
         }
 
+    @staticmethod
+    def _merge_receipt_info(target: dict[str, Any], receipt: dict[str, Any], *, source: str) -> None:
+        """Merge immutable receipt fields without hiding runtime conflicts."""
+        conflicts = {
+            key: (target[key], value)
+            for key, value in receipt.items()
+            if key in target and target[key] != value
+        }
+        if conflicts:
+            details = ", ".join(
+                f"{key}: runtime={runtime!r}, declared={declared!r}"
+                for key, (runtime, declared) in sorted(conflicts.items())
+            )
+            raise RuntimeError(f"{source} receipt conflict ({details})")
+        for key, value in receipt.items():
+            target.setdefault(key, value)
+
+    def _merge_backend_receipt_info(self, target: dict[str, Any]) -> None:
+        # In particular, never overwrite ReplayEnv.step()'s dynamics_mode with
+        # a server-side declaration. Matching values are retained verbatim;
+        # stale or contradictory declarations fail the rollout.
+        self._merge_receipt_info(
+            target,
+            self._backend_receipt_info(),
+            source="backend runtime",
+        )
+
     def _render_observation(self, observation: Any) -> str:
         if self.config.observation_render == "resource_compact_pipe_v1":
             return _to_resource_compact_pipe_v1(observation)
@@ -315,11 +342,12 @@ class OpenAirCongestionEnv(GymnasiumServer):
             "tier": meta.tier,
             "max_steps": meta.max_steps,
         }
-        reset_info.update(self._backend_receipt_info())
-        reset_info.update(self.backend.episode_receipt_info(meta.episode_id))
-        # App-level render selection is authoritative if a backend receipt ever
-        # grows an identically named field.
-        reset_info["observation_render"] = self.config.observation_render
+        self._merge_backend_receipt_info(reset_info)
+        self._merge_receipt_info(
+            reset_info,
+            self.backend.episode_receipt_info(meta.episode_id),
+            source="backend episode",
+        )
         return self._render_observation(first_obs), reset_info
 
     async def step(
@@ -329,7 +357,7 @@ class OpenAirCongestionEnv(GymnasiumServer):
         if state is None:
             # /step without /reset (defensive; gymnasium_agent always resets).
             info = {"error": "no_active_episode"}
-            info.update(self._backend_receipt_info())
+            self._merge_backend_receipt_info(info)
             return None, 0.0, False, True, info
 
         state["agent_steps"] += 1
@@ -436,7 +464,7 @@ class OpenAirCongestionEnv(GymnasiumServer):
                 "cumulative_reward": state["cumulative_reward"],
             }
         )
-        response_info.update(self._backend_receipt_info())
+        self._merge_backend_receipt_info(response_info)
         if protocol_error is not None:
             response_info.update(
                 {

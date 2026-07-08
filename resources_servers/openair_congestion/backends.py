@@ -70,9 +70,12 @@ except ImportError as exc:  # pragma: no cover - exercised only when unpackaged
         "See resources_servers/openair_congestion/README.md (Setup)."
     ) from exc
 
+from openair_congestion import replay_env as _replay_env  # noqa: E402
 from openair_congestion import rewards as _rewards  # noqa: E402
-from openair_congestion.replay_env import ReplayEnv  # noqa: E402
 from openair_congestion.schemas import EpisodeMeta, Observation, ToolCall  # noqa: E402
+
+
+ReplayEnv = _replay_env.ReplayEnv
 
 
 NAMED_REWARD_PROFILE_OVERRIDES: dict[str, dict[str, float]] = {
@@ -84,6 +87,39 @@ NAMED_REWARD_PROFILE_OVERRIDES: dict[str, dict[str, float]] = {
         "w_action": 0.0,
     },
 }
+
+
+def _replay_action_effect_version() -> str:
+    """Resolve and cross-check the action-effect model executed by ReplayEnv.
+
+    The telco environment owns this identifier.  Requiring its constant and
+    callable receipt to agree prevents this server from silently advertising a
+    stale, locally hard-coded dynamics version after that environment changes.
+    """
+    exported = getattr(_replay_env, "ACTION_EFFECT_VERSION", None)
+    reporter = getattr(_replay_env, "action_effect_version", None)
+    if not isinstance(exported, str) or not exported or exported.strip() != exported:
+        raise RuntimeError(
+            "ReplayEnv must export a non-empty, whitespace-free "
+            "ACTION_EFFECT_VERSION receipt"
+        )
+    if not callable(reporter):
+        raise RuntimeError("ReplayEnv must export callable action_effect_version()")
+    try:
+        reported = reporter()
+    except Exception as exc:
+        raise RuntimeError("ReplayEnv action_effect_version() receipt failed") from exc
+    if not isinstance(reported, str) or not reported or reported.strip() != reported:
+        raise RuntimeError(
+            "ReplayEnv action_effect_version() must return a non-empty, "
+            "whitespace-free string"
+        )
+    if reported != exported:
+        raise RuntimeError(
+            "ReplayEnv action-effect receipt mismatch: "
+            f"ACTION_EFFECT_VERSION={exported!r}, action_effect_version()={reported!r}"
+        )
+    return reported
 
 
 def validate_reward_profile(profile: str, overrides: Optional[dict[str, float]]) -> None:
@@ -185,7 +221,6 @@ class ReplayBackend(Backend):
     """
 
     backend_name = "replay"
-    dynamics_mode = "synthetic_action_effect_v1"
     action_affects_observation = True
     reward_profile = "env_default"
 
@@ -202,6 +237,10 @@ class ReplayBackend(Backend):
         pool_size: int = 32,
         max_steps_default: int = 60,
     ) -> None:
+        # The installed telco environment is the sole authority for synthetic
+        # dynamics provenance. Resolve it at server boot and fail closed if its
+        # two public receipts are absent or inconsistent.
+        self.dynamics_mode = _replay_action_effect_version()
         self._env = ReplayEnv(
             replay_root=replay_root,
             pool_size=pool_size,
@@ -249,7 +288,15 @@ class ReplayBackend(Backend):
                 self._open_episode_ids.discard(episode_id)
 
     def step(self, episode_id: str, tool_call: ToolCall) -> tuple[Observation, float, bool, dict[str, Any]]:
-        return self._env.step(episode_id, tool_call)
+        observation, reward, terminated, info = self._env.step(episode_id, tool_call)
+        runtime_mode = info.get("dynamics_mode")
+        if runtime_mode != self.dynamics_mode:
+            state = "missing" if runtime_mode is None else f"inconsistent ({runtime_mode!r})"
+            raise RuntimeError(
+                "ReplayEnv step dynamics_mode receipt is "
+                f"{state}; expected installed runtime {self.dynamics_mode!r}"
+            )
+        return observation, reward, terminated, info
 
     def close(self, episode_id: str) -> dict[str, Any]:
         with self._track_lock:
