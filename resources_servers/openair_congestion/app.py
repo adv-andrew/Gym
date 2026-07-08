@@ -163,6 +163,11 @@ class OpenAirCongestionResourcesServerConfig(BaseResourcesServerConfig):
     def bind_reward_profile_to_weights(self) -> "OpenAirCongestionResourcesServerConfig":
         overrides = self.reward_weights.model_dump(exclude_none=True) if self.reward_weights else None
         validate_reward_profile(self.reward_profile, overrides)
+        if self.backend != "dataset_replay" and (self.reward_profile != "openair_v1" or overrides):
+            raise ValueError(
+                "reward_profile/reward_weights apply only to backend='dataset_replay'; "
+                f"backend={self.backend!r} uses its environment-owned default reward"
+            )
         return self
 
 

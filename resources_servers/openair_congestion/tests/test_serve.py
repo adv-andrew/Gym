@@ -52,6 +52,12 @@ def test_named_profile_rejects_unsealed_weight_override():
         serve.config_from_args(args)
 
 
+def test_replay_rejects_dataset_only_reward_profile():
+    args = serve.build_parser().parse_args(["--backend", "replay", "--reward-profile", "openair_v2_measured"])
+    with pytest.raises(ValueError, match="dataset_replay"):
+        serve.config_from_args(args)
+
+
 def test_run_server_hardcodes_one_uvicorn_worker(monkeypatch):
     config = serve.config_from_args(serve.build_parser().parse_args([]))
     app = object()

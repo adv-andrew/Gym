@@ -517,6 +517,16 @@ class TestConfigValidation:
             {"reward_profile": "openair_v2_measured"},
             {"reward_profile": "openair_v1", "reward_weights": {"w_sla": 0.0}},
             {"reward_profile": "custom"},
+            {
+                "backend": "replay",
+                "reward_profile": "openair_v2_measured",
+                "reward_weights": {
+                    "w_sla": 0.0,
+                    "w_sla_level": 0.0,
+                    "w_buffer": 0.0,
+                    "w_action": 0.0,
+                },
+            },
         ],
     )
     def test_bad_or_unknown_config_fails_at_startup(self, overrides):
