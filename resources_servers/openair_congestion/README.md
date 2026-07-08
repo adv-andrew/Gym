@@ -166,11 +166,11 @@ ng_test +entrypoint=resources_servers/openair_congestion
 pytest resources_servers/openair_congestion/tests -q
 ```
 
-`tests/test_reward_correctness.py` is the reward oracle: on fixed replay seeds, scripted congestion relief must out-return random valid play, which must out-return `noop`, which must out-return always-rejected catastrophic play; per step, clearing an SLA violation, dropping PRB below the pressure threshold, or draining buffers never scores lower, and a rejected action always scores below the same step accepted. All assertions are relative orderings, never absolute thresholds, so a reward renormalization does not invalidate them.
+`tests/test_reward_correctness.py` is the reward oracle: on fixed replay seeds, scripted targeted congestion relief must out-return `noop`, which must out-return random valid play, which must out-return always-rejected catastrophic play. This ordering is intentional under the v3 zero-sum action model: an action passing the guardrail is not automatically beneficial, and arbitrary controls should lose to deliberately standing pat. Per step, clearing an SLA violation, dropping PRB below the pressure threshold, or draining buffers never scores lower, and a rejected action always scores below the same step accepted. All assertions are relative orderings, never absolute thresholds, so a reward renormalization does not invalidate them.
 
 ## Verification
 
-Episode return is the undiscounted sum of per-step reward totals. Each step's reward comes from the env's `rewards.compute_breakdown(prev_obs, curr_obs, action, rejected=...)` -- a weighted mix of SLA-violation, throughput, and fairness deltas plus congestion-pressure level terms -- and passes through the backend layer unchanged. Guardrail-rejected actions keep the episode alive and earn the rejection penalty; turns with no tool call return 0.0 without advancing the env. Identical `seed` plus action sequence yields an identical observation sequence on the offline backends.
+Episode return is the undiscounted sum of per-step reward totals. Each step's reward comes from the env's `rewards.compute_breakdown(prev_obs, curr_obs, action, rejected=...)` -- a weighted mix of SLA-violation, throughput, and fairness deltas plus congestion-pressure level terms -- and passes through the backend layer unchanged. Guardrail-rejected actions, including turns with no tool call, consume a transition, keep the episode alive until its normal horizon, and earn the rejection penalty. Identical `seed` plus action sequence yields an identical observation sequence on the offline backends.
 
 ## License
 
