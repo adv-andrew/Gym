@@ -132,6 +132,17 @@ Add `+limit=1` for a quick single-episode test.
 python resources_servers/openair_congestion/client.py
 ```
 
+### Capability sweep
+
+`model_sweep.py` is the pre-training environment check: it profiles how the environment attributes reward across policies of known and varying capability, over the same HTTP surface as the client demo. Four scripted anchors always run (congestion relief > random-valid > noop > catastrophic -- the reward-oracle ladder), and any number of OpenAI-compatible chat-completions models can be swept alongside them from a JSON spec. A sound environment must rank the anchors in their known order and rank LLM policies consistently with their general capability -- a frontier model landing no higher than a small one means reward attribution is suspect, not the models. Anchors need no model server or API key:
+
+```bash
+python resources_servers/openair_congestion/model_sweep.py
+python resources_servers/openair_congestion/model_sweep.py --models sweep_models.json --out sweep.json
+```
+
+The report prints mean/std return, the gap to the relief anchor, rejection rate, noop rate, invalid tool calls, parse failures, and dropped episodes per policy, plus an explicit anchor-ordering verdict. The process exits nonzero when the anchor ordering breaks, so the sweep doubles as a CI gate. LLM prompting is single-turn (the row's system and task prompts plus the current observation), so models are compared on state-reading rather than context management.
+
 ### Run tests
 
 ```bash

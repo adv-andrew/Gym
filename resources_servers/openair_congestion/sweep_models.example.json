@@ -1,0 +1,16 @@
+[
+  {
+    "label": "frontier",
+    "model": "gpt-5.6",
+    "base_url": "https://api.openai.com/v1",
+    "api_key_env": "OPENAI_API_KEY",
+    "temperature": 0.2
+  },
+  {
+    "label": "qwen3-1.7b",
+    "model": "qwen/qwen3-1.7b",
+    "base_url": "https://integrate.api.nvidia.com/v1",
+    "api_key_env": "NVIDIA_API_KEY",
+    "temperature": 0.2
+  }
+]
