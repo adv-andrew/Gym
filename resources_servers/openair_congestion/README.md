@@ -143,6 +143,16 @@ python resources_servers/openair_congestion/model_sweep.py --models sweep_models
 
 The report prints mean/std return, the gap to the relief anchor, rejection rate, noop rate, invalid tool calls, parse failures, and dropped episodes per policy, plus an explicit anchor-ordering verdict. The process exits nonzero when the anchor ordering breaks, so the sweep doubles as a CI gate. LLM prompting is single-turn (the row's system and task prompts plus the current observation), so models are compared on state-reading rather than context management.
 
+### Golden set (derived-oracle benchmark)
+
+No public benchmark exists for this task, so `golden_set.py` derives one from the environment. Because the replay backend is deterministic, the best single intervention for any state is computable: reconstruct the state, try every action in a finite grid, coast (noop) to the episode end, and keep the highest-value one. Labels are derived from the dynamics, not opined by a model, so any reviewer can recompute them. Scoring a policy measures how much of each state's golden margin it recovers; an oracle that replays the golden action recovers ~1, noop ~0, so the metric is self-validating.
+
+```bash
+python resources_servers/openair_congestion/golden_set.py --out golden_set_v0.jsonl
+```
+
+The set spans all five congestion regimes, which also surfaces *where* control matters: single-action opportunities concentrate under `interference` (best move: switch to proportional-fair scheduling) and are near-zero under `prb_exhaustion`. The hand-written relief rule is regime-specific and recovers little of the interference margin -- a concrete, objective argument for learning the policy rather than hand-coding it. This is a v0 (best-single-intervention over a finite grid, held-out seed band); scoring the trained base/SFT/GRPO policies against it is the evaluation step.
+
 ### Run tests
 
 ```bash
