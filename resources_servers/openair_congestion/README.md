@@ -134,7 +134,7 @@ python resources_servers/openair_congestion/client.py
 
 ### Capability sweep
 
-`model_sweep.py` is the pre-training environment check: it profiles how the environment attributes reward across policies of known and varying capability, over the same HTTP surface as the client demo. Four scripted anchors always run (congestion relief > random-valid > noop > catastrophic -- the reward-oracle ladder), and any number of OpenAI-compatible chat-completions models can be swept alongside them from a JSON spec. A sound environment must rank the anchors in their known order and rank LLM policies consistently with their general capability -- a frontier model landing no higher than a small one means reward attribution is suspect, not the models. Anchors need no model server or API key:
+`model_sweep.py` is the pre-training environment check: it profiles how the environment attributes reward across policies of known and varying capability, over the same HTTP surface as the client demo. Four scripted anchors always run (congestion relief > noop > random-valid > catastrophic -- the V3 reward-oracle ladder), and any number of OpenAI-compatible chat-completions models can be swept alongside them from a JSON spec. Here, `random-valid` means guardrail-valid, not beneficial: persistent zero-sum PRB caps can make unguided random control worse than standing pat. A sound environment must rank the anchors in their known order and rank LLM policies consistently with their general capability -- a frontier model landing no higher than a small one means reward attribution is suspect, not the models. Anchors need no model server or API key:
 
 ```bash
 python resources_servers/openair_congestion/model_sweep.py
@@ -162,7 +162,7 @@ ng_test +entrypoint=resources_servers/openair_congestion
 pytest resources_servers/openair_congestion/tests -q
 ```
 
-`tests/test_reward_correctness.py` is the reward oracle: on fixed replay seeds, scripted congestion relief must out-return random valid play, which must out-return `noop`, which must out-return always-rejected catastrophic play; per step, clearing an SLA violation, dropping PRB below the pressure threshold, or draining buffers never scores lower, and a rejected action always scores below the same step accepted. All assertions are relative orderings, never absolute thresholds, so a reward renormalization does not invalidate them.
+`tests/test_reward_correctness.py` is the reward oracle: on fixed replay seeds, scripted congestion relief must out-return `noop`, which must out-return guardrail-valid random play, which must out-return always-rejected catastrophic play. The random-policy ordering is intentional under V3: accepted persistent PRB caps can still be harmful. Per step, clearing an SLA violation, dropping PRB below the pressure threshold, or draining buffers never scores lower, and a rejected action always scores below the same step accepted. All assertions are relative orderings, never absolute thresholds, so a reward renormalization does not invalidate them.
 
 ## Verification
 

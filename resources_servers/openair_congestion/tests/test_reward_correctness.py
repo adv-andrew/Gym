@@ -180,19 +180,19 @@ def _mean_return(backend: ReplayBackend, make_policy, seed: int, difficulty: flo
 
 
 class TestPolicyLadder:
-    def test_relief_beats_random_valid_beats_noop_beats_catastrophic(self):
-        # Empirical ladder on the fixed tasks (2-cell/4-UE fallback scenario).
-        # Noop sits below random-valid because most accepted actions have
-        # net-positive synthetic effects (w_action is 0.0), and far above
-        # catastrophic play, which pays the rejection penalty every step.
-        # Only the ordering is asserted; the magnitudes may be renormalized.
+    def test_relief_beats_noop_beats_random_valid_beats_catastrophic(self):
+        # Empirical ladder on the fixed tasks.  With V3 persistent zero-sum
+        # PRB-cap dynamics, a guardrail-valid random cap is often harmful: it
+        # never samples the 273 release and can persistently starve a UE.
+        # This is a safety signal, not a reason to tune the random policy or
+        # the reward.  Only the ordering is asserted; magnitudes may change.
         backend = _make_backend()
         for seed, difficulty in _LADDER_TASKS:
             relief = _mean_return(backend, lambda: _relief_policy, seed, difficulty)
             random_valid = _mean_return(backend, _make_random_valid_policy, seed, difficulty)
             noop = _mean_return(backend, lambda: _noop_policy, seed, difficulty)
             catastrophic = _mean_return(backend, lambda: _catastrophic_policy, seed, difficulty)
-            assert relief > random_valid > noop > catastrophic, (
+            assert relief > noop > random_valid > catastrophic, (
                 f"ladder broken on seed={seed} difficulty={difficulty}: "
                 f"relief={relief:.4f} random={random_valid:.4f} noop={noop:.4f} catastrophic={catastrophic:.4f}"
             )

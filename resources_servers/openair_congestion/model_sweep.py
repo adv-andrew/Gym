@@ -17,7 +17,7 @@
 
 Environment sanity check, run before any training: drive seeded episodes over
 the real HTTP surface for a ladder of scripted anchor policies of known
-quality (congestion relief > random-valid > noop > catastrophic) and,
+quality (congestion relief > noop > random-valid > catastrophic) and,
 optionally, any number of OpenAI-compatible chat-completions models. A sound
 environment must (a) rank the scripted anchors in their known order and
 (b) rank LLM policies consistently with their general capability -- if a
@@ -113,7 +113,10 @@ def _parse_topology(observation: str) -> dict[int, list[int]]:
 
 def _make_random_valid() -> Callable[[str, int, random.Random], dict[str, Any]]:
     # Mirrors the reward-oracle test policy (tests/test_reward_correctness.py):
-    # uniform over the five valid tool families with the same argument ranges,
+    # uniform over the five guardrail-valid tool families with the same argument
+    # ranges.  "valid" means accepted by the guardrail, not beneficial: under
+    # the V3 persistent zero-sum PRB dynamics this deliberately unguided policy
+    # is expected to score below standing pat on the fixed ladder tasks.
     # deduplicated against the last two actions so the identical-action rate
     # limit never fires -- but reading the rendered text, like an LLM would.
     recent: list[str] = []
@@ -183,8 +186,10 @@ _ANCHORS: dict[str, Callable[[], Callable[[str, int, random.Random], dict[str, A
     "anchor:noop": lambda: _noop,
     "anchor:catastrophic": lambda: _catastrophic,
 }
-# The known quality ordering the environment must reproduce (best to worst).
-_ANCHOR_ORDER = ("anchor:relief", "anchor:random-valid", "anchor:noop", "anchor:catastrophic")
+# The known quality ordering for the V3 persistent zero-sum replay dynamics
+# (best to worst).  Guardrail-valid random control is intentionally not
+# treated as beneficial control.
+_ANCHOR_ORDER = ("anchor:relief", "anchor:noop", "anchor:random-valid", "anchor:catastrophic")
 
 
 @dataclass
@@ -464,7 +469,7 @@ def _print_report(report: dict[str, Any]) -> None:
             f"{r['invalid_calls']:>8} {r['parse_failures']:>11} {r['infra_errors']:>6} {r['episodes']:>4}"
         )
     verdict = "PASS" if report["anchor_ordering_ok"] else "FAIL"
-    print(f"\nanchor ordering (relief > random-valid > noop > catastrophic): {verdict}")
+    print(f"\nanchor ordering (relief > noop > random-valid > catastrophic): {verdict}")
     if not report["anchor_ordering_ok"]:
         print("a broken anchor ordering means reward attribution is suspect -- investigate before training.")
 

@@ -36,16 +36,19 @@ effect over the horizon. Each row carries:
 Margin is the opportunity: how much the best single action beats inaction
 here. Near-zero margin means the state is not a real decision point, so
 evaluation focuses on the positive-margin subset. The set spans all five
-congestion regimes, which also surfaces *where* actions matter -- margins are
-largest under interference/qos_competition and near-zero under prb_exhaustion.
+congestion regimes, which also surfaces *where* actions matter -- current v0
+margins are concentrated under interference and near-zero under prb_exhaustion.
+Do not imply qos-competition opportunity coverage without a regenerated
+benchmark receipt.
 
 Scoring a policy is one intervention: at each golden state, apply the policy's
 action, coast to the end, and measure how much of the golden margin it
 recovers, `(policy_value - noop_value) / (golden_value - noop_value)`, clipped
-to [0, 1]. The validity ladder: an oracle that replays the golden action
-recovers ~all the margin, noop none, random-valid in between. The hand-written
-relief rule is reported too -- its regime-specific recovery is a finding, not
-the gate.
+to [0, 1]. The validity checks are intentionally minimal: an oracle that
+replays the golden action recovers ~all the margin and noop recovers none.
+Random guardrail-valid play is reported descriptively, not used as a gate,
+because it can be harmful under persistent zero-sum PRB dynamics. The
+hand-written relief rule is likewise a finding, not a gate.
 
 This is a v0: best-single-intervention value over a finite action grid, not
 multi-step optimal control, on a held-out seed band disjoint from
@@ -302,7 +305,7 @@ def main() -> None:
         opp = [r for r in rr if r.margin > _OPPORTUNITY_MARGIN]
         top = max((r.margin for r in rr), default=0.0)
         print(f"{regime:<18} {len(rr):>7} {len(opp):>14} {top:>12.3f}")
-    print("\n(opportunities are where a single action beats coasting -- concentrated in interference/qos regimes)\n")
+    print("\n(opportunities are where a single action beats coasting -- current v0 is concentrated in interference)\n")
 
     if args.out:
         with open(args.out, "w") as f:
@@ -314,11 +317,11 @@ def main() -> None:
         # Import here so generation has no dependency on the sweep module.
         from resources_servers.openair_congestion.model_sweep import _make_random_valid, choose_action
 
-        # Validity ladder: the oracle (replays the golden action) must recover
-        # ~all the margin, noop none, random-valid in between. That monotone
-        # order proves the metric is well-formed. `relief` is reported too, but
-        # it is NOT the gate -- it is a hand-tuned heuristic, and its recovery
-        # is the finding, not the check.
+        # The benchmark's validity claims are only that the oracle recovers
+        # the margin and noop does not.  Random guardrail-valid play is
+        # descriptive: V3 persistent zero-sum caps can make it worse than
+        # noop, so treating it as an ordering gate would hide a real safety
+        # signal.  `relief` is also reported as a regime-specific finding.
         anchors: dict[str, PolicyFn] = {
             "oracle": _oracle_policy(rows),
             "relief": lambda obs, _c=choose_action: _c(obs, 0),
@@ -343,8 +346,8 @@ def main() -> None:
             r = score_policy_against_golden(regime_rows, anchors["relief"])
             print(f"  {regime:<18} {r['mean_margin_recovered']:>6.3f}  ({r['scored_rows']} opportunities)")
 
-        ok = recovered["oracle"] > 0.95 and recovered["noop"] < 0.01 and recovered["random-valid"] > recovered["noop"]
-        print(f"\nbenchmark validity (oracle recovers ~1, noop ~0, random between): {'PASS' if ok else 'FAIL'}")
+        ok = recovered["oracle"] > 0.95 and recovered["noop"] < 0.01
+        print(f"\nbenchmark validity (oracle recovers ~1, noop ~0): {'PASS' if ok else 'FAIL'}")
         if not ok:
             raise SystemExit(1)
 
