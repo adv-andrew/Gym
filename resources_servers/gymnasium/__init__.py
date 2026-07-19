@@ -14,6 +14,8 @@
 # limitations under the License.
 
 from .base import (
+    EnvCloseRequest,
+    EnvCloseResponse,
     EnvResetRequest,
     EnvResetResponse,
     EnvStepRequest,
@@ -24,6 +26,8 @@ from .base import (
 
 
 __all__ = [
+    "EnvCloseRequest",
+    "EnvCloseResponse",
     "EnvResetRequest",
     "EnvResetResponse",
     "EnvStepRequest",

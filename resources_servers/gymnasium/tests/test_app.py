@@ -20,7 +20,13 @@ import pytest
 from nemo_gym.base_resources_server import BaseResourcesServerConfig
 from nemo_gym.openai_utils import NeMoGymResponse, NeMoGymResponseOutputMessage, NeMoGymResponseOutputText
 from nemo_gym.server_utils import SESSION_ID_KEY, ServerClient
-from resources_servers.gymnasium import EnvResetRequest, EnvStepRequest, GymnasiumServer, extract_text
+from resources_servers.gymnasium import (
+    EnvCloseRequest,
+    EnvResetRequest,
+    EnvStepRequest,
+    GymnasiumServer,
+    extract_text,
+)
 
 
 def _make_response(*parts: str) -> NeMoGymResponse:
@@ -86,7 +92,19 @@ class TestGymnasiumServer:
     def test_routes_registered(self):
         env = _make_env(_TerminatingEnv)
         routes = {r.path for r in env.setup_webserver().routes}
-        assert {"/reset", "/step", "/aggregate_metrics"}.issubset(routes)
+        assert {"/reset", "/step", "/close", "/aggregate_metrics"}.issubset(routes)
+
+    @pytest.mark.asyncio
+    async def test_explicit_close_is_idempotent(self):
+        env = _make_env(_OngoingEnv)
+        env.session_state["sid-1"] = {"x": 1}
+        first = await env._close_endpoint(EnvCloseRequest(), _FakeRequest("sid-1"))
+        assert first.ok is True
+        assert first.already_closed is False
+        assert "sid-1" not in env.session_state
+        second = await env._close_endpoint(EnvCloseRequest(), _FakeRequest("sid-1"))
+        assert second.ok is True
+        assert second.already_closed is True
 
     def test_verify_raises(self):
         env = _make_env(_TerminatingEnv)
