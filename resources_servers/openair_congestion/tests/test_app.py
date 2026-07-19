@@ -49,10 +49,13 @@ from resources_servers.openair_congestion.backends import (  # noqa: E402
     ReplayBackend,
     select_backend,
 )
+from resources_servers.openair_congestion import candidate_contract  # noqa: E402
 
 
 def _make_env(**config_overrides) -> OpenAirCongestionEnv:
-    config = OpenAirCongestionResourcesServerConfig(host="", port=0, entrypoint="", name="", **config_overrides)
+    config_values = {"host": "", "port": 0, "entrypoint": "", "name": ""}
+    config_values.update(config_overrides)
+    config = OpenAirCongestionResourcesServerConfig(**config_values)
     return OpenAirCongestionEnv(config=config, server_client=MagicMock(spec=ServerClient))
 
 
@@ -98,6 +101,41 @@ def _tool_response(name: str, arguments: dict) -> NeMoGymResponse:
     )
 
 
+def _raw_tool_response(name: str, arguments: str) -> NeMoGymResponse:
+    """Build one deliberately malformed function call for protocol tests."""
+
+    return NeMoGymResponse(
+        output=[
+            NeMoGymResponseFunctionToolCall(
+                arguments=arguments,
+                call_id="call_0",
+                name=name,
+                type="function_call",
+                id="fc_0",
+                status="completed",
+            )
+        ],
+        **_RESPONSE_KWARGS,
+    )
+
+
+def _multi_tool_response(*actions: tuple[str, dict]) -> NeMoGymResponse:
+    return NeMoGymResponse(
+        output=[
+            NeMoGymResponseFunctionToolCall(
+                arguments=json.dumps(arguments),
+                call_id=f"call_{index}",
+                name=name,
+                type="function_call",
+                id=f"fc_{index}",
+                status="completed",
+            )
+            for index, (name, arguments) in enumerate(actions)
+        ],
+        **_RESPONSE_KWARGS,
+    )
+
+
 _TASK_METADATA = {
     "seed": 7001,
     "difficulty": 0.6,
@@ -106,6 +144,15 @@ _TASK_METADATA = {
     "tier": "replay",
     "max_steps": 16,
 }
+
+_V10_TASK_METADATA = {
+    **_TASK_METADATA,
+    "tier": "T2",
+    "max_steps": 4,
+}
+_V10_TEST_SESSION_SECRET = "test-only-v10-session-secret-2v0yQdG2w8Tn0Hkx6cA7"
+_V10_TEST_SYSTEM_PROMPT_SHA256 = "1" * 64
+_V10_TEST_TASK_MANIFEST_SHA256 = "2" * 64
 
 
 class TestReset:
@@ -255,11 +302,615 @@ class TestStep:
         assert info["error"] == "no_active_episode"
 
 
+class TestV10ConstrainedProtocol:
+    """The V10 path is deliberately narrower than the generic resource server."""
+
+    @staticmethod
+    def _env() -> OpenAirCongestionEnv:
+        return _make_env(
+            protocol_mode=candidate_contract.RUNB2_V10_PROTOCOL_MODE,
+            v10_session_secret=_V10_TEST_SESSION_SECRET,
+            v10_system_prompt_sha256=_V10_TEST_SYSTEM_PROMPT_SHA256,
+            v10_task_manifest_sha256=_V10_TEST_TASK_MANIFEST_SHA256,
+        )
+
+    @pytest.mark.asyncio
+    async def test_reset_renders_and_metadata_bind_one_authoritative_support(self):
+        env = self._env()
+        observation, info = await env.reset(dict(_V10_TASK_METADATA), session_id="sid")
+        parsed = candidate_contract.parse_rendered_support(observation)
+        assert parsed.support_sha256 == info["candidate_support_sha256"]
+        assert parsed.actions == tuple(info["candidate_actions"])
+        assert info["visible_action_support_sha256"] == parsed.support_sha256
+        assert info["environment_contract"] == {
+            "schema_version": candidate_contract.RUNB2_V10_ACTION_EFFECT_CONTRACT_SCHEMA,
+            "backend": "replay",
+            "dynamics_mode": "synthetic_action_effect_v3_zero_sum_prb273",
+            "action_affects_observation": True,
+            "candidate_contract": candidate_contract.RESOURCE_CANDIDATE_CONTRACT,
+        }
+        assert info["action_scope"] == candidate_contract.RUNB2_V10_ACTION_SCOPE
+        assert set(info["reward_weights"]) == {
+            "w_sla", "w_tput", "w_fair", "w_buffer", "w_sla_level",
+            "w_prb_level", "w_access_level", "w_fair_level", "w_action", "w_reject",
+        }
+        assert info["tier"] == "T2"
+        assert parsed.visible_binding_schema == (
+            candidate_contract.RUNB2_V10_VISIBLE_BINDING_SCHEMA
+        )
+        assert parsed.visible_binding_sha256 is not None
+        binding = info["server_observation_binding"]
+        assert set(binding) == {
+            "observation_sha256",
+            "candidate_support_sha256",
+            "binding_payload",
+        }
+        assert binding["observation_sha256"] == candidate_contract.text_sha256(observation)
+        assert binding["candidate_support_sha256"] == parsed.support_sha256
+        assert set(binding["binding_payload"]) == {
+            "schema_version",
+            "protocol_mode",
+            "action_scope",
+            "observation_render",
+            "candidate_contract",
+            "candidate_action_argument_contract",
+            "environment_contract",
+            "reward_contract",
+            "capacity_contract",
+            "runtime_manifest",
+            "launch_contract",
+            "candidate_support_sha256",
+            "candidate_capacity_milli_mbps_by_cell",
+            "observation_without_binding_sha256",
+        }
+        assert binding["binding_payload"]["candidate_support_sha256"] == parsed.support_sha256
+        assert binding["binding_payload"]["observation_without_binding_sha256"] == (
+            candidate_contract.text_sha256(observation.rsplit("\n", 1)[0])
+        )
+        assert binding["binding_payload"]["capacity_contract"] == {
+            "unit": "milli_mbps",
+            "candidate_cell_capacity_mbps": 60.0,
+        }
+        assert binding["binding_payload"]["runtime_manifest"] == {
+            "schema_version": candidate_contract.RUNB2_V10_RUNTIME_MANIFEST_SCHEMA,
+            "sha256": info["server_runtime_manifest_sha256"],
+        }
+        assert binding["binding_payload"]["launch_contract"] == {
+            "schema_version": candidate_contract.RUNB2_V10_LAUNCH_CONTRACT_SCHEMA,
+            "system_prompt_sha256": _V10_TEST_SYSTEM_PROMPT_SHA256,
+            "task_manifest_sha256": _V10_TEST_TASK_MANIFEST_SHA256,
+        }
+        assert info["v10_launch_contract"] == binding["binding_payload"]["launch_contract"]
+        assert info["server_runtime_manifest_sha256"] == candidate_contract.canonical_json_sha256(
+            info["server_runtime_manifest"]
+        )
+        assert _V10_TEST_SESSION_SECRET not in candidate_contract.canonical_json(
+            info["server_runtime_manifest"]
+        )
+        task_receipt = info["task_budget_receipt"]
+        assert task_receipt["schema_version"] == "openair_runb2_v10_task_budget_receipt_v1"
+        assert task_receipt["task_params"] == {
+            "seed": 7001,
+            "difficulty": 0.6,
+            "regime_mix": {"prb_exhaustion": 1.0},
+            "scenario_id": "prb_exhaustion",
+            "tier": "T2",
+            "max_steps": 4,
+        }
+        assert task_receipt["requested_max_steps"] == 4
+        assert task_receipt["runtime_manifest_sha256"] == info[
+            "server_runtime_manifest_sha256"
+        ]
+        assert task_receipt["launch_contract"] == info["v10_launch_contract"]
+        assert info["task_budget_receipt_sha256"] == candidate_contract.canonical_json_sha256(
+            task_receipt
+        )
+        reset_receipt = info["reset_receipt"]
+        assert reset_receipt["schema_version"] == "openair_runb2_v10_reset_receipt_v1"
+        assert reset_receipt["task_budget_receipt_sha256"] == info[
+            "task_budget_receipt_sha256"
+        ]
+        assert reset_receipt["initial_observation_sha256"] == candidate_contract.text_sha256(
+            observation
+        )
+        assert reset_receipt["initial_candidate_support_sha256"] == parsed.support_sha256
+        assert reset_receipt["initial_binding_payload_sha256"] == candidate_contract.canonical_json_sha256(
+            binding["binding_payload"]
+        )
+        assert info["reset_receipt_sha256"] == candidate_contract.canonical_json_sha256(
+            reset_receipt
+        )
+        assert binding["binding_payload"]["candidate_capacity_milli_mbps_by_cell"] == [
+            {"cell_id": row["cell_id"], "capacity_milli_mbps": 60_000}
+            for row in binding["binding_payload"]["candidate_capacity_milli_mbps_by_cell"]
+        ]
+        assert parsed.visible_binding_sha256 == candidate_contract.canonical_json_sha256(
+            binding["binding_payload"]
+        )
+        assert observation.rsplit("\n", 1)[1] == (
+            f"V10B|{candidate_contract.RUNB2_V10_VISIBLE_BINDING_SCHEMA}|"
+            f"{parsed.visible_binding_sha256}"
+        )
+        assert sum(line.startswith("V10B|") for line in observation.split("\n")) == 1
+
+        tampered = observation.replace("RCA|0|", "RCA|1|", 1)
+        with pytest.raises(candidate_contract.CandidateContractError):
+            candidate_contract.parse_rendered_support(tampered)
+
+    @pytest.mark.asyncio
+    async def test_supported_call_has_pre_step_attestation_and_complete_reward_arithmetic(self):
+        env = self._env()
+        observation, reset_info = await env.reset(dict(_V10_TASK_METADATA), session_id="sid")
+        support = candidate_contract.parse_rendered_support(observation)
+        action = support.actions[0]
+        next_observation, reward, terminated, truncated, info = await env.step(
+            _tool_response(action["name"], action["arguments"]), {}, session_id="sid"
+        )
+        assert not terminated and not truncated
+        assert info["protocol_rejection"] is False
+        assert info["submitted_candidate_supported"] is True
+        assert info["submitted_candidate_support_sha256"] == reset_info["candidate_support_sha256"]
+        assert info["submitted_action"] == action
+        assert info["action"] == action
+        assert info["scalar_reward"] == pytest.approx(reward)
+        assert info["reward_terms"]["total"] == pytest.approx(reward)
+        assert sum(
+            value for key, value in info["reward_terms"].items() if key != "total"
+        ) == pytest.approx(reward)
+        assert all(math.isfinite(value) for value in info["reward_measurements"].values())
+        assert info["training_eligible"] is True
+        assert info["rollout_usable"] is True
+        assert info["training_usable"] is True
+        receipt = info["server_step_receipt"]
+        assert set(receipt) == {
+            "action",
+            "submitted_action",
+            "scalar_reward",
+            "reward_measurements",
+            "reward_measurements_sha256",
+            "reward_terms",
+            "reward_terms_sha256",
+            "guardrail_accepted",
+            "protocol_rejection",
+            "submitted_candidate_contract",
+            "submitted_candidate_support_sha256",
+            "submitted_candidate_supported",
+            "rejection_reason",
+            "error",
+            "kpi_source",
+            "dynamics_mode",
+            "reward_profile",
+            "reward_weights",
+            "terminated",
+            "truncated",
+            "training_usable",
+            "runtime_manifest_sha256",
+            "launch_contract",
+            "task_budget_receipt_sha256",
+            "reset_receipt_sha256",
+            "transition_binding_sha256",
+        }
+        assert receipt["action"] == action == receipt["submitted_action"]
+        assert receipt["scalar_reward"] == pytest.approx(reward)
+        assert receipt["reward_measurements"] == info["reward_measurements"]
+        assert receipt["reward_terms"] == info["reward_terms"]
+        assert receipt["reward_measurements_sha256"] == candidate_contract.canonical_json_sha256(
+            receipt["reward_measurements"]
+        )
+        assert receipt["reward_terms_sha256"] == candidate_contract.canonical_json_sha256(
+            receipt["reward_terms"]
+        )
+        assert receipt["reward_weights"] == info["reward_weights"]
+        assert receipt["dynamics_mode"] == info["dynamics_mode"]
+        assert receipt["submitted_candidate_support_sha256"] == reset_info[
+            "candidate_support_sha256"
+        ]
+        assert receipt["training_usable"] is True
+        assert receipt["runtime_manifest_sha256"] == reset_info[
+            "server_runtime_manifest_sha256"
+        ]
+        assert receipt["launch_contract"] == reset_info["v10_launch_contract"]
+        assert receipt["task_budget_receipt_sha256"] == reset_info[
+            "task_budget_receipt_sha256"
+        ]
+        assert receipt["reset_receipt_sha256"] == reset_info["reset_receipt_sha256"]
+        assert info["server_step_receipt_sha256"] == candidate_contract.canonical_json_sha256(
+            receipt
+        )
+        assert next_observation is not None
+        assert candidate_contract.parse_rendered_support(next_observation).support_sha256 == info[
+            "candidate_support_sha256"
+        ]
+        assert info["server_observation_binding"]["observation_sha256"] == (
+            candidate_contract.text_sha256(next_observation)
+        )
+        transition = info["server_transition_binding"]
+        assert set(transition) == {
+            "schema_version",
+            "action",
+            "runtime_manifest_sha256",
+            "launch_contract",
+            "task_budget_receipt_sha256",
+            "reset_receipt_sha256",
+            "pre_observation_sha256",
+            "pre_candidate_support_sha256",
+            "pre_binding_payload_sha256",
+            "pre_cell_count",
+            "pre_capacity_milli_mbps_total",
+            "post_observation",
+            "post_observation_sha256",
+            "post_candidate_support_sha256",
+            "post_cell_count",
+            "post_capacity_milli_mbps_total",
+            "post_binding_payload",
+        }
+        assert transition["schema_version"] == "openair_runb2_v10_transition_binding_v2"
+        assert transition["action"] == action
+        assert transition["runtime_manifest_sha256"] == reset_info[
+            "server_runtime_manifest_sha256"
+        ]
+        assert transition["launch_contract"] == reset_info["v10_launch_contract"]
+        assert transition["task_budget_receipt_sha256"] == reset_info[
+            "task_budget_receipt_sha256"
+        ]
+        assert transition["reset_receipt_sha256"] == reset_info["reset_receipt_sha256"]
+        assert info["server_transition_binding_sha256"] == candidate_contract.canonical_json_sha256(
+            transition
+        )
+        assert receipt["transition_binding_sha256"] == info[
+            "server_transition_binding_sha256"
+        ]
+        assert transition["pre_observation_sha256"] == candidate_contract.text_sha256(observation)
+        assert transition["pre_candidate_support_sha256"] == reset_info[
+            "candidate_support_sha256"
+        ]
+        assert transition["post_observation"] == next_observation
+        assert transition["post_observation_sha256"] == candidate_contract.text_sha256(
+            next_observation
+        )
+        assert transition["post_binding_payload"] == info[
+            "server_observation_binding"
+        ]["binding_payload"]
+        assert transition["post_binding_payload"][
+            "observation_without_binding_sha256"
+        ] == candidate_contract.text_sha256(next_observation.rsplit("\n", 1)[0])
+        assert transition["pre_cell_count"] == transition["post_cell_count"]
+        assert transition["pre_capacity_milli_mbps_total"] == transition[
+            "post_capacity_milli_mbps_total"
+        ] == 60_000 * transition["post_cell_count"]
+        assert info["reward_measurements"]["cell_capacity_mbps_total"] == pytest.approx(
+            60.0 * transition["post_cell_count"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_v10_terminal_quarantines_every_invalid_call_shape(self):
+        env = self._env()
+        cases = (
+            (
+                "no_function_call",
+                _text_response("I will decide later."),
+                "exactly_one_function_call_required",
+            ),
+            (
+                "multiple_function_calls",
+                _multi_tool_response(("noop", {}), ("noop", {})),
+                "multiple_function_calls_forbidden",
+            ),
+            (
+                "malformed_json",
+                _raw_tool_response("noop", "{not-json"),
+                "invalid_candidate:",
+            ),
+            (
+                "duplicate_json_key",
+                _raw_tool_response("noop", '{"x":1,"x":2}'),
+                "invalid_candidate:",
+            ),
+            (
+                "nonfinite_json_constant",
+                _raw_tool_response("noop", '{"x":NaN}'),
+                "invalid_candidate:",
+            ),
+            (
+                "out_of_support",
+                _tool_response(
+                    "set_prb_cap",
+                    {"cell_id": 0, "target": "ue", "target_id": 999, "max_prb": 200},
+                ),
+                "candidate_not_in_pre_step_support",
+            ),
+        )
+        for session_id, response, reason in cases:
+            await env.reset(dict(_V10_TASK_METADATA), session_id=session_id)
+            observation, reward, terminated, truncated, info = await env.step(
+                response,
+                {},
+                session_id=session_id,
+            )
+            assert observation is None
+            assert reward == 0.0 and terminated is False and truncated is True
+            assert info["protocol_rejection"] is True
+            assert info["terminal_quarantine"] is True
+            assert info["training_eligible"] is False
+            assert info["rollout_usable"] is False
+            assert info["training_usable"] is False
+            assert info["reward_measurements"] is None
+            assert info["reward_terms"] is None
+            assert info["rejection_reason"].startswith(reason)
+            assert session_id not in env.session_state
+
+    @pytest.mark.asyncio
+    async def test_v10_supported_prb_cap_changes_synthetic_kpis_relative_to_noop(self):
+        # This is the causal claim V10 is allowed to make: on the same replay
+        # state, an accepted *visible* PRB cap changes measured synthetic KPI
+        # values.  Comparing the opaque rendered text alone would be weaker,
+        # because its L-row also echoes the chosen action.
+        acting = self._env()
+        baseline = self._env()
+        _, acting_info = await acting.reset(dict(_V10_TASK_METADATA), session_id="acting")
+        await baseline.reset(dict(_V10_TASK_METADATA), session_id="baseline")
+        action = next(
+            item
+            for item in acting_info["candidate_actions"]
+            if item["name"] == "set_prb_cap" and item["arguments"]["max_prb"] < 273
+        )
+        _, _, _, _, acted = await acting.step(
+            _tool_response(action["name"], action["arguments"]), {}, session_id="acting"
+        )
+        _, _, _, _, nooped = await baseline.step(
+            _tool_response("noop", {}), {}, session_id="baseline"
+        )
+        assert acted["guardrail_accepted"] is True
+        assert acted["prb_cap_dynamics"]
+        assert acted["reward_measurements"]["aggregate_delivered_mbps"] != pytest.approx(
+            nooped["reward_measurements"]["aggregate_delivered_mbps"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_v10_reset_metadata_is_a_deep_copy_not_authoritative_state(self):
+        env = self._env()
+        _, info = await env.reset(dict(_V10_TASK_METADATA), session_id="sid")
+        index = next(
+            i
+            for i, action in enumerate(info["candidate_actions"])
+            if action["name"] == "set_prb_cap"
+        )
+        original = dict(
+            env.session_state["sid"]["candidate_support"].actions[index]["arguments"]
+        )
+        info["candidate_actions"][index]["arguments"]["max_prb"] = 1
+        assert env.session_state["sid"]["candidate_support"].actions[index][
+            "arguments"
+        ] == original
+
+    @pytest.mark.asyncio
+    async def test_v10_rejects_ambiguous_or_incomplete_task_row_before_opening(self):
+        env = self._env()
+        with pytest.raises(RuntimeError, match="exact deterministic schema"):
+            await env.reset(dict(_V10_TASK_METADATA, unrelated="not-consumed"), session_id="extra")
+        with pytest.raises(RuntimeError, match="exact deterministic schema"):
+            incomplete = dict(_V10_TASK_METADATA)
+            del incomplete["regime_mix"]
+            await env.reset(incomplete, session_id="missing")
+        assert not env.session_state
+
+    @pytest.mark.asyncio
+    async def test_v10_runtime_manifest_drift_fails_closed(self, monkeypatch):
+        env = self._env()
+        await env.reset(dict(_V10_TASK_METADATA), session_id="sid")
+        original_payload = env._v10_runtime_manifest_payload
+
+        def drifted_payload():
+            payload = original_payload()
+            payload["dependency_versions"] = dict(payload["dependency_versions"])
+            payload["dependency_versions"]["python"] = "injected-drift"
+            return payload
+
+        monkeypatch.setattr(env, "_v10_runtime_manifest_payload", drifted_payload)
+        with pytest.raises(RuntimeError, match="runtime source/config drifted"):
+            env._v10_static_info(env.session_state["sid"]["candidate_support"])
+
+    @pytest.mark.asyncio
+    async def test_v10_runtime_manifest_drift_during_step_releases_slot(self, monkeypatch):
+        env = self._env()
+        observation, info = await env.reset(dict(_V10_TASK_METADATA), session_id="sid")
+        support = candidate_contract.parse_rendered_support(observation)
+        closed: list[str] = []
+        original_close = env.backend.close
+
+        def tracked_close(episode_id):
+            closed.append(episode_id)
+            return original_close(episode_id)
+
+        original_payload = env._v10_runtime_manifest_payload
+
+        def drifted_payload():
+            payload = original_payload()
+            payload["dependency_versions"] = dict(payload["dependency_versions"])
+            payload["dependency_versions"]["python"] = "injected-drift"
+            return payload
+
+        monkeypatch.setattr(env.backend, "close", tracked_close)
+        monkeypatch.setattr(env, "_v10_runtime_manifest_payload", drifted_payload)
+        with pytest.raises(RuntimeError, match="runtime source/config drifted"):
+            await env.step(
+                _tool_response(support.actions[0]["name"], support.actions[0]["arguments"]),
+                {},
+                session_id="sid",
+            )
+
+        assert "sid" not in env.session_state
+        assert closed == [info["episode_id"]]
+
+    @pytest.mark.asyncio
+    async def test_v10_requires_t2_and_replay_at_configuration_boundary(self, monkeypatch):
+        env = self._env()
+        with pytest.raises(RuntimeError, match="tier='T2'"):
+            await env.reset(dict(_TASK_METADATA), session_id="sid")
+
+        monkeypatch.setattr(
+            "resources_servers.openair_congestion.app.select_backend",
+            lambda _config: object(),
+        )
+        with pytest.raises(RuntimeError, match="requires backend='replay'"):
+            _make_env(
+                protocol_mode=candidate_contract.RUNB2_V10_PROTOCOL_MODE,
+                v10_session_secret=_V10_TEST_SESSION_SECRET,
+                v10_system_prompt_sha256=_V10_TEST_SYSTEM_PROMPT_SHA256,
+                v10_task_manifest_sha256=_V10_TEST_TASK_MANIFEST_SHA256,
+            )
+
+    @pytest.mark.parametrize(
+        ("overrides", "error"),
+        (
+            ({"v10_session_secret": None}, "requires an injected high-entropy"),
+            ({"v10_session_secret": "too-short"}, "requires an injected high-entropy"),
+            ({"v10_system_prompt_sha256": None}, "requires a pinned lowercase SHA-256"),
+            ({"v10_system_prompt_sha256": "A" * 64}, "requires a pinned lowercase SHA-256"),
+            ({"v10_task_manifest_sha256": None}, "requires a pinned lowercase SHA-256"),
+            ({"v10_task_manifest_sha256": "B" * 64}, "requires a pinned lowercase SHA-256"),
+            ({"backend": "dataset_replay"}, "requires config backend='replay'"),
+            ({"num_workers": 2}, "requires exactly one FastAPI worker"),
+            ({"host": "0.0.0.0"}, "requires an in-process test host or a loopback host"),
+            ({"entrypoint": "serve.py"}, "requires the bound app.py entrypoint"),
+            ({"cell_capacity_mbps": 59.0}, "fixes cell_capacity_mbps at 60.0"),
+            ({"candidate_cell_capacity_mbps": 60.0}, "was removed for V10"),
+            ({"v10_max_steps": 17}, "v10_max_steps must be a positive integer"),
+            ({"v10_max_steps": 5, "agent_max_steps": 4}, "v10_max_steps must be"),
+        ),
+    )
+    def test_v10_refuses_unsafe_launch_configuration(self, overrides, error):
+        config = {
+            "protocol_mode": candidate_contract.RUNB2_V10_PROTOCOL_MODE,
+            "v10_session_secret": _V10_TEST_SESSION_SECRET,
+            "v10_system_prompt_sha256": _V10_TEST_SYSTEM_PROMPT_SHA256,
+            "v10_task_manifest_sha256": _V10_TEST_TASK_MANIFEST_SHA256,
+            **overrides,
+        }
+        with pytest.raises(RuntimeError, match=error):
+            _make_env(**config)
+
+    def test_v10_refuses_nonreplay_environment_backend_override(self, monkeypatch):
+        monkeypatch.setenv("OPENAIR_CONGESTION_BACKEND", "dataset_replay")
+        with pytest.raises(RuntimeError, match="OPENAIR_CONGESTION_BACKEND"):
+            self._env()
+
+    def test_v10_refuses_dynamic_congestion_generator(self, monkeypatch):
+        monkeypatch.setattr(
+            "resources_servers.openair_congestion.app.importlib.util.find_spec",
+            lambda _name: object(),
+        )
+        with pytest.raises(RuntimeError, match="fixed 60-Mbps fallback replay source"):
+            self._env()
+
+    @pytest.mark.asyncio
+    async def test_v10_requires_explicit_bounded_task_max_steps(self):
+        env = self._env()
+        missing_budget = dict(_V10_TASK_METADATA)
+        del missing_budget["max_steps"]
+        with pytest.raises(RuntimeError, match="exact deterministic schema"):
+            await env.reset(missing_budget, session_id="missing")
+        assert "missing" not in env.session_state
+
+        with pytest.raises(RuntimeError, match="exceeds the configured V10 launch bound"):
+            await env.reset(
+                dict(_V10_TASK_METADATA, max_steps=17),
+                session_id="oversized",
+            )
+        assert "oversized" not in env.session_state
+
+    @pytest.mark.asyncio
+    async def test_v10_terminal_budget_eagerly_releases_the_session(self):
+        env = self._env()
+        observation, _ = await env.reset(
+            dict(_V10_TASK_METADATA, max_steps=1),
+            session_id="sid",
+        )
+        support = candidate_contract.parse_rendered_support(observation)
+        _, _, terminated, truncated, info = await env.step(
+            _tool_response(support.actions[0]["name"], support.actions[0]["arguments"]),
+            {},
+            session_id="sid",
+        )
+        assert terminated or truncated
+        assert info["training_usable"] is False
+        assert "sid" not in env.session_state
+
+    @pytest.mark.asyncio
+    async def test_v10_contract_failure_discards_transition_and_releases_slot(self, monkeypatch):
+        env = self._env()
+        observation, _ = await env.reset(dict(_V10_TASK_METADATA), session_id="sid")
+        support = candidate_contract.parse_rendered_support(observation)
+        original_step = env.backend.step
+
+        def corrupted_step(*args, **kwargs):
+            next_obs, reward, done, step_info = original_step(*args, **kwargs)
+            step_info = dict(step_info)
+            terms = dict(step_info["reward_terms"])
+            terms["total"] += 0.01
+            step_info["reward_terms"] = terms
+            return next_obs, reward, done, step_info
+
+        monkeypatch.setattr(env.backend, "step", corrupted_step)
+        observation, reward, terminated, truncated, info = await env.step(
+            _tool_response(support.actions[0]["name"], support.actions[0]["arguments"]),
+            {},
+            session_id="sid",
+        )
+        assert observation is None
+        assert reward == 0.0 and terminated is False and truncated is True
+        assert info["protocol_rejection"] is True
+        assert info["environment_transition_discarded"] is True
+        assert info["training_usable"] is False
+        assert "sid" not in env.session_state
+
+    @pytest.mark.asyncio
+    async def test_v10_backend_failure_returns_quarantine_and_releases_slot(self, monkeypatch):
+        env = self._env()
+        observation, _ = await env.reset(dict(_V10_TASK_METADATA), session_id="sid")
+        support = candidate_contract.parse_rendered_support(observation)
+
+        def failed_step(*_args, **_kwargs):
+            raise RuntimeError("injected backend failure")
+
+        monkeypatch.setattr(env.backend, "step", failed_step)
+        observation, reward, terminated, truncated, info = await env.step(
+            _tool_response(support.actions[0]["name"], support.actions[0]["arguments"]),
+            {},
+            session_id="sid",
+        )
+        assert observation is None
+        assert reward == 0.0 and terminated is False and truncated is True
+        assert info["rejection_reason"] == "backend_step_failure"
+        assert info["environment_transition_discarded"] is True
+        assert "sid" not in env.session_state
+
+    @pytest.mark.asyncio
+    async def test_v10_reset_contract_failure_closes_the_opened_episode(self, monkeypatch):
+        env = self._env()
+        closed: list[str] = []
+        original_close = env.backend.close
+
+        def tracked_close(episode_id):
+            closed.append(episode_id)
+            return original_close(episode_id)
+
+        def failed_support(_self, _observation):
+            raise RuntimeError("injected support binding failure")
+
+        monkeypatch.setattr(env.backend, "close", tracked_close)
+        monkeypatch.setattr(OpenAirCongestionEnv, "_v10_support_for_observation", failed_support)
+        with pytest.raises(RuntimeError, match="injected support binding failure"):
+            await env.reset(dict(_V10_TASK_METADATA), session_id="sid")
+        assert closed
+        assert "sid" not in env.session_state
+
+
 class TestRoutes:
     def test_gymnasium_routes_registered(self):
         env = _make_env()
         routes = {r.path for r in env.setup_webserver().routes}
-        assert {"/reset", "/step", "/aggregate_metrics"}.issubset(routes)
+        assert {"/reset", "/step", "/close", "/aggregate_metrics"}.issubset(routes)
 
 
 def _http_client(app) -> httpx.AsyncClient:
@@ -350,6 +1001,53 @@ class TestHTTPSurface:
             info = response.json()["info"]
             assert info["episode_id"] != episode_dead
             assert env.session_state[next(iter(env.session_state))]["episode_id"] == info["episode_id"]
+
+    @pytest.mark.asyncio
+    async def test_explicit_close_is_cookie_scoped_and_idempotent(self):
+        env = _make_env(pool_size=1)
+        app = env.setup_webserver()
+        async with _http_client(app) as client:
+            reset = await client.post("/reset", json=_reset_body())
+            assert reset.status_code == 200
+            first = await client.post("/close", json={})
+            assert first.status_code == 200
+            assert first.json()["ok"] is True
+            assert first.json()["already_closed"] is False
+            assert first.json()["summary"]["ok"] is True
+            assert not env.session_state
+            second = await client.post("/close", json={})
+            assert second.status_code == 200
+            assert second.json()["already_closed"] is True
+
+    @pytest.mark.asyncio
+    async def test_v10_http_cookie_contract_binds_the_pre_step_support(self):
+        env = _make_env(
+            protocol_mode=candidate_contract.RUNB2_V10_PROTOCOL_MODE,
+            v10_session_secret=_V10_TEST_SESSION_SECRET,
+            v10_system_prompt_sha256=_V10_TEST_SYSTEM_PROMPT_SHA256,
+            v10_task_manifest_sha256=_V10_TEST_TASK_MANIFEST_SHA256,
+        )
+        app = env.setup_webserver()
+        async with _http_client(app) as client:
+            reset = await client.post("/reset", json=_reset_body(tier="T2", max_steps=4))
+            assert reset.status_code == 200
+            reset_body = reset.json()
+            support = candidate_contract.parse_rendered_support(reset_body["observation"])
+            step = await client.post(
+                "/step",
+                json=_step_body(support.actions[0]["name"], support.actions[0]["arguments"]),
+            )
+            assert step.status_code == 200
+            step_body = step.json()
+            assert step_body["info"]["submitted_candidate_support_sha256"] == support.support_sha256
+            assert step_body["info"]["submitted_candidate_supported"] is True
+            assert step_body["info"]["protocol_rejection"] is False
+            assert step_body["info"]["training_usable"] is True
+            set_cookie = reset.headers["set-cookie"]
+            assert "openair_v10_session=" in set_cookie
+            assert _V10_TEST_SESSION_SECRET not in set_cookie
+            assert "httponly" in set_cookie.lower()
+            assert "samesite=strict" in set_cookie.lower()
 
 
 class TestBackends:

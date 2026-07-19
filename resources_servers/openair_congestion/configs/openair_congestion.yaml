@@ -45,6 +45,24 @@ openair_congestion:
       # openair_v2_measured runs zero the synthetic-proxy terms:
       # reward_weights: {w_sla: 0.0, w_sla_level: 0.0, w_buffer: 0.0, w_action: 0.0}
       #
+      # V10 constrained-decoding corpus collection is deliberately narrower
+      # than the generic eight-tool server.  It must use synthetic replay,
+      # tier=T2 task rows, and exposes only noop plus server-rendered UE PRB
+      # cap candidates as RCP/RCC/RCA/V10B text.  Do not report this mode as
+      # a full-tool policy result.  V10 fixes replay/reward candidate capacity
+      # to 60.0 Mbps per cell (RCC=60000); there is intentionally no separate
+      # candidate-capacity knob to drift from the causal reward source.
+      # It also requires one worker, a fresh launch-injected session secret,
+      # and the pre-sealed prompt/task-manifest digests.  These are evidence
+      # bindings, not model inputs; never substitute a development default.
+      # (e.g. `OPENAIR_V10_SESSION_SECRET=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')`).
+      # protocol_mode: runb2_v10_t2_prb_v1
+      # v10_max_steps: 16
+      # num_workers: 1
+      # v10_session_secret: ${oc.env:OPENAIR_V10_SESSION_SECRET}
+      # v10_system_prompt_sha256: ${oc.env:OPENAIR_V10_SYSTEM_PROMPT_SHA256}
+      # v10_task_manifest_sha256: ${oc.env:OPENAIR_V10_TASK_MANIFEST_SHA256}
+      #
       # oai_collector knobs (all forwarded by select_backend; unused until the
       # live wiring lands — see backends.py OAICollectorBackend docstring):
       # kpi_url: http://localhost:9090/metrics
