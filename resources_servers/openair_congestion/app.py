@@ -33,7 +33,6 @@ and must be importable in this venv; see the README Setup section.
 
 from __future__ import annotations
 
-from dataclasses import asdict
 import hashlib
 import importlib
 import importlib.metadata
@@ -42,8 +41,9 @@ import json
 import math
 import os
 import platform
-from pathlib import Path
 import re
+from dataclasses import asdict
+from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -54,17 +54,16 @@ from nemo_gym.base_resources_server import BaseResourcesServerConfig
 from nemo_gym.openai_utils import NeMoGymResponse, NeMoGymResponseFunctionToolCall
 from nemo_gym.server_utils import SESSION_ID_KEY
 from resources_servers.gymnasium import GymnasiumServer
+from resources_servers.gymnasium import base as gymnasium_base_source
 
 # backends guards the cross-repo 'openair_congestion' import; keep it ahead of
 # the telco imports so a missing install fails with the pip hint.
 from resources_servers.openair_congestion import backends as backends_source
-from resources_servers.openair_congestion.backends import Backend, ReplayBackend, select_backend
 from resources_servers.openair_congestion import candidate_contract
-from resources_servers.gymnasium import base as gymnasium_base_source
+from resources_servers.openair_congestion.backends import Backend, ReplayBackend, select_backend
 
 
 # isort: split
-from openair_congestion.render import to_user_text
 from openair_congestion import env as env_source
 from openair_congestion import guardrail as guardrail_source
 from openair_congestion import kpi_client as kpi_client_source
@@ -73,8 +72,10 @@ from openair_congestion import replay_env as replay_env_source
 from openair_congestion import rewards as reward_source
 from openair_congestion import schemas as schemas_source
 from openair_congestion import t2_action_mask as t2_action_mask_source
+from openair_congestion import t2_candidate_sampler as t2_candidate_sampler_source
 from openair_congestion import t2_policy_features as t2_policy_features_source
 from openair_congestion import tools as tools_source
+from openair_congestion.render import to_user_text
 from openair_congestion.replay_env import action_effect_version
 from openair_congestion.rewards import DEFAULT_WEIGHTS, compute_breakdown
 from openair_congestion.schemas import ToolCall
@@ -551,6 +552,7 @@ class OpenAirCongestionEnv(GymnasiumServer):
             "openair_congestion.rewards": reward_source,
             "openair_congestion.schemas": schemas_source,
             "openair_congestion.t2_action_mask": t2_action_mask_source,
+            "openair_congestion.t2_candidate_sampler": t2_candidate_sampler_source,
             "openair_congestion.t2_policy_features": t2_policy_features_source,
             "openair_congestion.tools": tools_source,
         }

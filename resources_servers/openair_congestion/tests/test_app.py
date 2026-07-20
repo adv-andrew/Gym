@@ -40,6 +40,7 @@ openair = pytest.importorskip(
     reason="telco env package 'openair_congestion' not installed; see README Setup",
 )
 
+from resources_servers.openair_congestion import candidate_contract  # noqa: E402
 from resources_servers.openair_congestion.app import (  # noqa: E402
     OpenAirCongestionEnv,
     OpenAirCongestionResourcesServerConfig,
@@ -49,7 +50,6 @@ from resources_servers.openair_congestion.backends import (  # noqa: E402
     ReplayBackend,
     select_backend,
 )
-from resources_servers.openair_congestion import candidate_contract  # noqa: E402
 
 
 def _make_env(**config_overrides) -> OpenAirCongestionEnv:
@@ -384,6 +384,9 @@ class TestV10ConstrainedProtocol:
         assert info["server_runtime_manifest_sha256"] == candidate_contract.canonical_json_sha256(
             info["server_runtime_manifest"]
         )
+        assert "openair_congestion.t2_candidate_sampler" in info[
+            "server_runtime_manifest"
+        ]["source_files"]
         assert _V10_TEST_SESSION_SECRET not in candidate_contract.canonical_json(
             info["server_runtime_manifest"]
         )
