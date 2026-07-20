@@ -60,7 +60,11 @@ from resources_servers.gymnasium import base as gymnasium_base_source
 # the telco imports so a missing install fails with the pip hint.
 from resources_servers.openair_congestion import backends as backends_source
 from resources_servers.openair_congestion import candidate_contract
-from resources_servers.openair_congestion.backends import Backend, ReplayBackend, select_backend
+from resources_servers.openair_congestion.backends import (
+    Backend,
+    V10FixedReplayBackend,
+    select_backend,
+)
 
 
 # isort: split
@@ -75,10 +79,12 @@ from openair_congestion import t2_action_mask as t2_action_mask_source
 from openair_congestion import t2_candidate_sampler as t2_candidate_sampler_source
 from openair_congestion import t2_policy_features as t2_policy_features_source
 from openair_congestion import tools as tools_source
+from openair_congestion import v10_fixed_replay as v10_fixed_replay_source
 from openair_congestion.render import to_user_text
 from openair_congestion.replay_env import action_effect_version
 from openair_congestion.rewards import DEFAULT_WEIGHTS, compute_breakdown
 from openair_congestion.schemas import ToolCall
+from openair_congestion.v10_fixed_replay import V10_FIXED_REPLAY_SCENARIO_SOURCE
 
 
 class OpenAirCongestionResourcesServerConfig(BaseResourcesServerConfig):
@@ -91,6 +97,9 @@ class OpenAirCongestionResourcesServerConfig(BaseResourcesServerConfig):
     replay_root: str = "data/replay"
     pool_size: int = 32
     max_steps_default: int = 60
+    # ``auto`` preserves the standard server's historical optional-generator
+    # behavior.  V10 rejects it and requires the exact fixed fallback source.
+    replay_scenario_source: str = "auto"
     # dataset_replay knobs: replay a recorded dataset (KPI snapshots or GRPO
     # rollout traces; see dataset_backend.py) instead of synthesizing
     # trajectories. cell_capacity_mbps feeds the reward's throughput
@@ -136,9 +145,7 @@ _NO_TOOL_CALL_MSG = (
 )
 
 _STANDARD_PROTOCOL_MODE = "standard"
-_SUPPORTED_PROTOCOL_MODES = frozenset(
-    {_STANDARD_PROTOCOL_MODE, candidate_contract.RUNB2_V10_PROTOCOL_MODE}
-)
+_SUPPORTED_PROTOCOL_MODES = frozenset({_STANDARD_PROTOCOL_MODE, candidate_contract.RUNB2_V10_PROTOCOL_MODE})
 _V10_SESSION_COOKIE_NAME = "openair_v10_session"
 _V10_SESSION_MAX_AGE_SECONDS = 15 * 60
 _V10_SESSION_SECRET_MIN_CHARS = 43  # len(secrets.token_urlsafe(32))
@@ -146,6 +153,7 @@ _V10_TASK_BUDGET_RECEIPT_SCHEMA = "openair_runb2_v10_task_budget_receipt_v1"
 _V10_RESET_RECEIPT_SCHEMA = "openair_runb2_v10_reset_receipt_v1"
 _V10_TRANSITION_BINDING_SCHEMA = "openair_runb2_v10_transition_binding_v2"
 _V10_RUNTIME_MANIFEST_SOURCE_SCHEMA = "openair_runb2_v10_runtime_manifest_v1"
+_V10_REPLAY_SCENARIO_SOURCE = V10_FIXED_REPLAY_SCENARIO_SOURCE
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _V10_REWARD_TERM_KEYS = frozenset(
     {
@@ -273,10 +281,7 @@ class OpenAirCongestionEnv(GymnasiumServer):
     def model_post_init(self, __context: Any) -> None:
         super().model_post_init(__context)
         if self.config.protocol_mode not in _SUPPORTED_PROTOCOL_MODES:
-            raise V10ProtocolError(
-                "protocol_mode must be one of "
-                f"{sorted(_SUPPORTED_PROTOCOL_MODES)!r}"
-            )
+            raise V10ProtocolError(f"protocol_mode must be one of {sorted(_SUPPORTED_PROTOCOL_MODES)!r}")
         if self._v10_protocol_enabled:
             # Validate the static V10 boundary before even constructing a
             # backend.  This avoids opening a dataset/live implementation on
@@ -284,10 +289,11 @@ class OpenAirCongestionEnv(GymnasiumServer):
             self._validate_v10_configuration()
         self._backend = select_backend(self.config)
         if self._v10_protocol_enabled:
-            if not isinstance(self._backend, ReplayBackend):
+            if not isinstance(self._backend, V10FixedReplayBackend):
                 raise V10ProtocolError(
-                    "V10 constrained protocol requires backend='replay', never "
-                    "dataset_replay or a live collector"
+                    "V10 constrained protocol requires backend='replay' with the "
+                    "fixed replay source, never standard replay, dataset_replay, "
+                    "or a live collector"
                 )
             self._freeze_v10_runtime_manifest()
 
@@ -308,17 +314,11 @@ class OpenAirCongestionEnv(GymnasiumServer):
         """Fail before serving if V10 would be state-unsafe or unbounded."""
 
         if self.config.backend.strip().lower() != "replay":
-            raise V10ProtocolError(
-                "V10 constrained protocol requires config backend='replay'"
-            )
+            raise V10ProtocolError("V10 constrained protocol requires config backend='replay'")
         environment_backend = os.environ.get("OPENAIR_CONGESTION_BACKEND")
-        if (
-            environment_backend is not None
-            and environment_backend.strip().lower() != "replay"
-        ):
+        if environment_backend is not None and environment_backend.strip().lower() != "replay":
             raise V10ProtocolError(
-                "V10 constrained protocol requires OPENAIR_CONGESTION_BACKEND "
-                "to be unset or 'replay'"
+                "V10 constrained protocol requires OPENAIR_CONGESTION_BACKEND to be unset or 'replay'"
             )
         if self.config.num_workers not in (None, 1):
             raise V10ProtocolError(
@@ -332,19 +332,19 @@ class OpenAirCongestionEnv(GymnasiumServer):
         # explicit loopback address recorded by its runner receipt.
         if self.config.host not in {"", "127.0.0.1", "::1"}:
             raise V10ProtocolError(
-                "V10 constrained protocol requires an in-process test host or "
-                "a loopback host (127.0.0.1/::1)"
+                "V10 constrained protocol requires an in-process test host or a loopback host (127.0.0.1/::1)"
             )
         if self.config.entrypoint not in {"", "app.py"}:
+            raise V10ProtocolError("V10 constrained protocol requires the bound app.py entrypoint")
+        if self.config.replay_scenario_source != _V10_REPLAY_SCENARIO_SOURCE:
             raise V10ProtocolError(
-                "V10 constrained protocol requires the bound app.py entrypoint"
+                f"V10 requires replay_scenario_source={_V10_REPLAY_SCENARIO_SOURCE!r}; 'auto' is forbidden"
             )
         if not self._is_strict_positive_int(self.config.agent_max_steps):
             raise V10ProtocolError("V10 agent_max_steps must be a positive integer")
         if (
             not self._is_strict_positive_int(self.config.v10_max_steps)
-            or self.config.v10_max_steps
-            > candidate_contract.RUNB2_V10_MAX_STEPS_HARD_CAP
+            or self.config.v10_max_steps > candidate_contract.RUNB2_V10_MAX_STEPS_HARD_CAP
             or self.config.v10_max_steps > self.config.agent_max_steps
         ):
             raise V10ProtocolError(
@@ -363,13 +363,11 @@ class OpenAirCongestionEnv(GymnasiumServer):
             or float(capacity) != candidate_contract.RUNB2_V10_CELL_CAPACITY_MBPS
         ):
             raise V10ProtocolError(
-                "V10 fixes cell_capacity_mbps at 60.0 to match replay reward and "
-                "candidate-capacity provenance"
+                "V10 fixes cell_capacity_mbps at 60.0 to match replay reward and candidate-capacity provenance"
             )
         if self.config.candidate_cell_capacity_mbps is not None:
             raise V10ProtocolError(
-                "candidate_cell_capacity_mbps was removed for V10; replay capacity "
-                "is pinned to 60.0 Mbps per cell"
+                "candidate_cell_capacity_mbps was removed for V10; replay capacity is pinned to 60.0 Mbps per cell"
             )
         secret = self.config.v10_session_secret
         # A cryptographic property cannot be inferred from a string, but an
@@ -389,41 +387,19 @@ class OpenAirCongestionEnv(GymnasiumServer):
         for field_name in ("v10_system_prompt_sha256", "v10_task_manifest_sha256"):
             value = getattr(self.config, field_name)
             if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
-                raise V10ProtocolError(
-                    f"V10 requires a pinned lowercase SHA-256 {field_name}"
-                )
+                raise V10ProtocolError(f"V10 requires a pinned lowercase SHA-256 {field_name}")
 
-        # The optional congestion_gen dependency changes replay capacity to
-        # its own 250-Mbps scenario scale.  V10's action-effect and reward
-        # contract is explicitly the deterministic 60-Mbps fallback.  Rather
-        # than produce self-inconsistent receipts, refuse V10 when that
-        # generator is importable until it has an explicitly reviewed V10
-        # source contract of its own.
-        try:
-            congestion_gen_available = importlib.util.find_spec("congestion_gen.sampler")
-        except (ImportError, ModuleNotFoundError):
-            congestion_gen_available = None
-        if congestion_gen_available is not None:
-            raise V10ProtocolError(
-                "V10 requires the fixed 60-Mbps fallback replay source; "
-                "congestion_gen.sampler is installed and changes that contract"
-            )
         reward_capacity_override = os.environ.get("ENV_REWARD_CELL_CAPACITY_MBPS")
         if reward_capacity_override is not None and reward_capacity_override.strip():
             try:
                 parsed_reward_capacity = float(reward_capacity_override)
             except ValueError as exc:
-                raise V10ProtocolError(
-                    "V10 ENV_REWARD_CELL_CAPACITY_MBPS must be unset or exactly 60.0"
-                ) from exc
+                raise V10ProtocolError("V10 ENV_REWARD_CELL_CAPACITY_MBPS must be unset or exactly 60.0") from exc
             if (
                 not math.isfinite(parsed_reward_capacity)
-                or parsed_reward_capacity
-                != candidate_contract.RUNB2_V10_CELL_CAPACITY_MBPS
+                or parsed_reward_capacity != candidate_contract.RUNB2_V10_CELL_CAPACITY_MBPS
             ):
-                raise V10ProtocolError(
-                    "V10 ENV_REWARD_CELL_CAPACITY_MBPS must be unset or exactly 60.0"
-                )
+                raise V10ProtocolError("V10 ENV_REWARD_CELL_CAPACITY_MBPS must be unset or exactly 60.0")
 
     def setup_session_middleware(self, app: FastAPI) -> None:
         """Use a launch-injected signing secret for V10 without leaking it as a cookie name."""
@@ -436,20 +412,14 @@ class OpenAirCongestionEnv(GymnasiumServer):
         # defensive assertion here because a subclass could call this method
         # during unusual test setup after mutating config.
         secret = self.config.v10_session_secret
-        if (
-            not isinstance(secret, str)
-            or not secret.isascii()
-            or len(secret) < _V10_SESSION_SECRET_MIN_CHARS
-        ):
+        if not isinstance(secret, str) or not secret.isascii() or len(secret) < _V10_SESSION_SECRET_MIN_CHARS:
             raise V10ProtocolError("V10 session middleware secret was not validated")
 
         # Register this function before SessionMiddleware so its request-side
         # execution sees request.session, matching the base-server ordering.
         @app.middleware("http")
         async def add_session_id(request: Request, call_next):
-            request.session[SESSION_ID_KEY] = request.session.get(
-                SESSION_ID_KEY, str(uuid4())
-            )
+            request.session[SESSION_ID_KEY] = request.session.get(SESSION_ID_KEY, str(uuid4()))
             response: Response = await call_next(request)
             return response
 
@@ -492,11 +462,22 @@ class OpenAirCongestionEnv(GymnasiumServer):
         replay transitions, reward arithmetic, or state lifetime is present.
         """
 
+        if not isinstance(self._backend, V10FixedReplayBackend):
+            raise V10ProtocolError("V10 scenario-source evidence requires V10FixedReplayBackend")
+        source_evidence = self._backend.scenario_source_evidence()
+        expected_source_evidence = {
+            "scenario_source": _V10_REPLAY_SCENARIO_SOURCE,
+            "dynamic_congestion_gen_configured": False,
+            "dynamic_congestion_gen_used": False,
+        }
+        if source_evidence != expected_source_evidence:
+            raise V10ProtocolError("V10 replay source evidence permits or used dynamic congestion_gen")
         return {
             "backend": self.config.backend,
             "replay_root": self.config.replay_root,
             "pool_size": self.config.pool_size,
             "max_steps_default": self.config.max_steps_default,
+            "replay_scenario_source": self.config.replay_scenario_source,
             "cell_capacity_mbps": self.config.cell_capacity_mbps,
             "protocol_mode": self.config.protocol_mode,
             "v10_max_steps": self.config.v10_max_steps,
@@ -504,11 +485,21 @@ class OpenAirCongestionEnv(GymnasiumServer):
             "num_workers": 1 if self.config.num_workers is None else self.config.num_workers,
             "reward_profile": candidate_contract.RUNB2_V10_REWARD_PROFILE,
             "reward_weights": asdict(DEFAULT_WEIGHTS),
-            "scenario_source": "fixed_60_mbps_fallback_without_congestion_gen_v1",
-            "env_reward_cell_capacity_mbps": (
-                os.environ.get("ENV_REWARD_CELL_CAPACITY_MBPS") or "unset"
-            ),
+            **source_evidence,
+            "dynamic_congestion_gen_importable": (self._dynamic_congestion_gen_importable()),
+            "env_reward_cell_capacity_mbps": (os.environ.get("ENV_REWARD_CELL_CAPACITY_MBPS") or "unset"),
         }
+
+    @staticmethod
+    def _dynamic_congestion_gen_importable() -> bool:
+        """Attest package visibility without making it a V10 behavior source."""
+
+        try:
+            return importlib.util.find_spec("congestion_gen.sampler") is not None
+        except (ImportError, ModuleNotFoundError):
+            return False
+        except (AttributeError, ValueError) as exc:
+            raise V10ProtocolError("cannot attest whether congestion_gen.sampler is importable") from exc
 
     @staticmethod
     def _dependency_version(distribution: str) -> str:
@@ -524,8 +515,9 @@ class OpenAirCongestionEnv(GymnasiumServer):
         accidental snapshot of ``sys.modules``.  Every local module listed
         here participates directly in request/session handling, finite support
         construction, replay transitions, reward calculation, or KPI/render
-        semantics.  V10 rejects dynamic congestion_gen imports above, so this
-        closure is complete for the allowed fixed-fallback source.
+        semantics.  V10 may attest an installed ``congestion_gen`` package,
+        but the explicit fixed source never imports it while building replay
+        trajectories, so it is not part of this behavior closure.
         """
 
         return {
@@ -534,9 +526,7 @@ class OpenAirCongestionEnv(GymnasiumServer):
             "resource_server.candidate_contract": candidate_contract,
             "gymnasium.package": importlib.import_module("resources_servers.gymnasium"),
             "gymnasium.base": gymnasium_base_source,
-            "nemo_gym.base_resources_server": importlib.import_module(
-                "nemo_gym.base_resources_server"
-            ),
+            "nemo_gym.base_resources_server": importlib.import_module("nemo_gym.base_resources_server"),
             "nemo_gym.server_utils": importlib.import_module("nemo_gym.server_utils"),
             "nemo_gym.openai_utils": importlib.import_module("nemo_gym.openai_utils"),
             "nemo_gym.config_types": importlib.import_module("nemo_gym.config_types"),
@@ -555,6 +545,7 @@ class OpenAirCongestionEnv(GymnasiumServer):
             "openair_congestion.t2_candidate_sampler": t2_candidate_sampler_source,
             "openair_congestion.t2_policy_features": t2_policy_features_source,
             "openair_congestion.tools": tools_source,
+            "openair_congestion.v10_fixed_replay": v10_fixed_replay_source,
         }
 
     def _v10_runtime_manifest_payload(self) -> dict[str, Any]:
@@ -564,12 +555,8 @@ class OpenAirCongestionEnv(GymnasiumServer):
         for logical_name, module in sorted(self._v10_runtime_source_modules().items()):
             source_path = getattr(module, "__file__", None)
             if not isinstance(source_path, str) or not source_path:
-                raise V10ProtocolError(
-                    f"V10 runtime source path is unavailable for {logical_name}"
-                )
-            source_files[logical_name] = self._sha256_source_file(
-                source_path, label=logical_name
-            )
+                raise V10ProtocolError(f"V10 runtime source path is unavailable for {logical_name}")
+            source_files[logical_name] = self._sha256_source_file(source_path, label=logical_name)
         app_sha = source_files["resource_server.app"]
         return {
             "schema_version": _V10_RUNTIME_MANIFEST_SOURCE_SCHEMA,
@@ -588,6 +575,7 @@ class OpenAirCongestionEnv(GymnasiumServer):
                 "numpy": self._dependency_version("numpy"),
                 "itsdangerous": self._dependency_version("itsdangerous"),
                 "openai": self._dependency_version("openai"),
+                "congestion_gen": self._dependency_version("congestion_gen"),
                 "uvicorn": self._dependency_version("uvicorn"),
                 "omegaconf": self._dependency_version("omegaconf"),
                 "ray": self._dependency_version("ray"),
@@ -599,7 +587,9 @@ class OpenAirCongestionEnv(GymnasiumServer):
                 "fixed_cell_capacity_mbps": candidate_contract.RUNB2_V10_CELL_CAPACITY_MBPS,
                 "single_worker": True,
                 "loopback_or_inprocess_only": True,
-                "dynamic_congestion_gen_forbidden": True,
+                "scenario_source": _V10_REPLAY_SCENARIO_SOURCE,
+                "dynamic_congestion_gen_configured": False,
+                "dynamic_congestion_gen_used": False,
             },
         }
 
@@ -608,25 +598,18 @@ class OpenAirCongestionEnv(GymnasiumServer):
         # Canonical JSON round-trip prevents later mutation of a nested object
         # from changing the receipt this running process claims to expose.
         self._v10_runtime_manifest = json.loads(candidate_contract.canonical_json(payload))
-        self._v10_runtime_manifest_sha256 = candidate_contract.canonical_json_sha256(
-            self._v10_runtime_manifest
-        )
+        self._v10_runtime_manifest_sha256 = candidate_contract.canonical_json_sha256(self._v10_runtime_manifest)
 
     def _assert_v10_runtime_manifest_is_current(self) -> None:
         """Fail closed if code/config/environment drift after startup."""
 
-        if (
-            self._v10_runtime_manifest is None
-            or self._v10_runtime_manifest_sha256 is None
-        ):
+        if self._v10_runtime_manifest is None or self._v10_runtime_manifest_sha256 is None:
             raise V10ProtocolError("V10 runtime manifest was not frozen at startup")
         self._validate_v10_configuration()
         current = self._v10_runtime_manifest_payload()
         current_sha = candidate_contract.canonical_json_sha256(current)
         if current_sha != self._v10_runtime_manifest_sha256:
-            raise V10ProtocolError(
-                "V10 runtime source/config drifted after startup; restart and recollect receipts"
-            )
+            raise V10ProtocolError("V10 runtime source/config drifted after startup; restart and recollect receipts")
 
     def _v10_runtime_manifest_ref(self) -> dict[str, str]:
         self._assert_v10_runtime_manifest_is_current()
@@ -666,19 +649,14 @@ class OpenAirCongestionEnv(GymnasiumServer):
             "candidate_contract": candidate_contract.RESOURCE_CANDIDATE_CONTRACT,
         }
 
-    def _v10_static_info(
-        self, support: candidate_contract.CandidateSupport
-    ) -> dict[str, Any]:
+    def _v10_static_info(self, support: candidate_contract.CandidateSupport) -> dict[str, Any]:
         """Return fields that must agree at reset and every accepted step."""
 
         if (
-            support.visible_binding_schema
-            != candidate_contract.RUNB2_V10_VISIBLE_BINDING_SCHEMA
+            support.visible_binding_schema != candidate_contract.RUNB2_V10_VISIBLE_BINDING_SCHEMA
             or support.visible_binding_payload is None
         ):
-            raise V10ProtocolError(
-                "V10 response attempted to expose support without its visible binding"
-            )
+            raise V10ProtocolError("V10 response attempted to expose support without its visible binding")
         return {
             "protocol_mode": candidate_contract.RUNB2_V10_PROTOCOL_MODE,
             "action_scope": candidate_contract.RUNB2_V10_ACTION_SCOPE,
@@ -693,16 +671,12 @@ class OpenAirCongestionEnv(GymnasiumServer):
             # builder can seal and independently rehash it without trusting a
             # mutable path on the training host.
             "server_runtime_manifest": self._v10_runtime_manifest_record(),
-            "server_runtime_manifest_sha256": self._v10_runtime_manifest_ref()[
-                "sha256"
-            ],
+            "server_runtime_manifest_sha256": self._v10_runtime_manifest_ref()["sha256"],
             "v10_launch_contract": self._v10_launch_contract(),
             **support.metadata(),
         }
 
-    def _v10_support_for_observation(
-        self, observation: Any
-    ) -> candidate_contract.CandidateSupport:
+    def _v10_support_for_observation(self, observation: Any) -> candidate_contract.CandidateSupport:
         try:
             support = candidate_contract.build_t2_prb_support(observation)
             binding_payload = candidate_contract.build_visible_binding_payload(
@@ -717,9 +691,7 @@ class OpenAirCongestionEnv(GymnasiumServer):
                 binding_payload=binding_payload,
             )
         except candidate_contract.CandidateContractError as exc:
-            raise V10ProtocolError(
-                "cannot render the authoritative V10 T2 finite support"
-            ) from exc
+            raise V10ProtocolError("cannot render the authoritative V10 T2 finite support") from exc
 
     def _live_episode_ids(self) -> set[str]:
         """Episode ids currently owned by live sessions (for the leak reaper)."""
@@ -730,13 +702,9 @@ class OpenAirCongestionEnv(GymnasiumServer):
 
         value = task_params.get("max_steps")
         if not self._is_strict_positive_int(value):
-            raise V10ProtocolError(
-                "V10 reset requires an explicit positive integer max_steps"
-            )
+            raise V10ProtocolError("V10 reset requires an explicit positive integer max_steps")
         if value > self.config.v10_max_steps:
-            raise V10ProtocolError(
-                "V10 task max_steps exceeds the configured V10 launch bound"
-            )
+            raise V10ProtocolError("V10 task max_steps exceeds the configured V10 launch bound")
         return value
 
     def _v10_normalize_task_params(self, metadata: dict[str, Any]) -> dict[str, Any]:
@@ -760,8 +728,7 @@ class OpenAirCongestionEnv(GymnasiumServer):
             missing = sorted(expected - actual)
             extra = sorted(actual - expected)
             raise V10ProtocolError(
-                "V10 reset task row must have the exact deterministic schema "
-                f"(missing={missing}, extra={extra})"
+                f"V10 reset task row must have the exact deterministic schema (missing={missing}, extra={extra})"
             )
         seed = metadata["seed"]
         if not isinstance(seed, int) or isinstance(seed, bool):
@@ -808,9 +775,7 @@ class OpenAirCongestionEnv(GymnasiumServer):
             "max_steps": max_steps,
         }
 
-    def _v10_task_budget_receipt(
-        self, *, task_params: dict[str, Any], requested_max_steps: int
-    ) -> dict[str, Any]:
+    def _v10_task_budget_receipt(self, *, task_params: dict[str, Any], requested_max_steps: int) -> dict[str, Any]:
         """Seal the exact reset task and the server budget it accepted.
 
         A runner's request alone is not evidence that the stateful server
@@ -824,9 +789,7 @@ class OpenAirCongestionEnv(GymnasiumServer):
             "protocol_mode": candidate_contract.RUNB2_V10_PROTOCOL_MODE,
             "tier": "T2",
             "task_params": normalized_task_params,
-            "task_params_sha256": candidate_contract.canonical_json_sha256(
-                normalized_task_params
-            ),
+            "task_params_sha256": candidate_contract.canonical_json_sha256(normalized_task_params),
             "requested_max_steps": requested_max_steps,
             "configured_v10_max_steps": self.config.v10_max_steps,
             "configured_agent_max_steps": self.config.agent_max_steps,
@@ -856,9 +819,7 @@ class OpenAirCongestionEnv(GymnasiumServer):
             "effective_seed": meta.seed,
             "effective_scenario_id": meta.scenario_id,
             "effective_tier": meta.tier,
-            "initial_observation_sha256": candidate_contract.text_sha256(
-                support.observation_text
-            ),
+            "initial_observation_sha256": candidate_contract.text_sha256(support.observation_text),
             "initial_candidate_support_sha256": support.support_sha256,
             "initial_binding_payload_sha256": candidate_contract.canonical_json_sha256(
                 support.visible_binding_payload
@@ -934,28 +895,20 @@ class OpenAirCongestionEnv(GymnasiumServer):
         v10_max_steps = task_params["max_steps"] if self._v10_protocol_enabled else None
         first_obs, meta = self.backend.reset(task_params, live_episode_ids=self._live_episode_ids())
         try:
-            support = (
-                self._v10_support_for_observation(first_obs)
-                if self._v10_protocol_enabled
-                else None
-            )
+            support = self._v10_support_for_observation(first_obs) if self._v10_protocol_enabled else None
             if support is not None:
                 assert v10_max_steps is not None
                 task_budget_receipt = self._v10_task_budget_receipt(
                     task_params=task_params,
                     requested_max_steps=v10_max_steps,
                 )
-                task_budget_receipt_sha256 = candidate_contract.canonical_json_sha256(
-                    task_budget_receipt
-                )
+                task_budget_receipt_sha256 = candidate_contract.canonical_json_sha256(task_budget_receipt)
                 reset_receipt = self._v10_reset_receipt(
                     task_budget_receipt_sha256=task_budget_receipt_sha256,
                     meta=meta,
                     support=support,
                 )
-                reset_receipt_sha256 = candidate_contract.canonical_json_sha256(
-                    reset_receipt
-                )
+                reset_receipt_sha256 = candidate_contract.canonical_json_sha256(reset_receipt)
         except Exception:
             # A failed render/binding after reset is still an opened replay
             # episode.  Do not wait for an HTTP close that will never arrive.
@@ -974,24 +927,17 @@ class OpenAirCongestionEnv(GymnasiumServer):
                 v10_max_steps
                 if v10_max_steps is not None
                 else int(
-                    task_params.get("max_steps")
-                    or min(self.config.max_steps_default, self.config.agent_max_steps)
+                    task_params.get("max_steps") or min(self.config.max_steps_default, self.config.agent_max_steps)
                 )
             ),
         }
         if support is not None:
             self.session_state[session_id]["candidate_support"] = support
             self.session_state[session_id]["last_observation"] = first_obs
-            self.session_state[session_id]["v10_task_budget_receipt"] = (
-                task_budget_receipt
-            )
-            self.session_state[session_id]["v10_task_budget_receipt_sha256"] = (
-                task_budget_receipt_sha256
-            )
+            self.session_state[session_id]["v10_task_budget_receipt"] = task_budget_receipt
+            self.session_state[session_id]["v10_task_budget_receipt_sha256"] = task_budget_receipt_sha256
             self.session_state[session_id]["v10_reset_receipt"] = reset_receipt
-            self.session_state[session_id]["v10_reset_receipt_sha256"] = (
-                reset_receipt_sha256
-            )
+            self.session_state[session_id]["v10_reset_receipt_sha256"] = reset_receipt_sha256
         # Observation appended as a user message after the dataset prompt.
         info = {
             "episode_id": meta.episode_id,
@@ -1027,24 +973,16 @@ class OpenAirCongestionEnv(GymnasiumServer):
         if expected_keys is not None and set(normalized) != expected_keys:
             missing = sorted(expected_keys - set(normalized))
             extra = sorted(set(normalized) - expected_keys)
-            raise V10ProtocolError(
-                f"{label} has the wrong exact schema (missing={missing}, extra={extra})"
-            )
+            raise V10ProtocolError(f"{label} has the wrong exact schema (missing={missing}, extra={extra})")
         return normalized
 
     @staticmethod
-    def _assert_close_mapping(
-        actual: dict[str, float], expected: dict[str, float], *, label: str
-    ) -> None:
+    def _assert_close_mapping(actual: dict[str, float], expected: dict[str, float], *, label: str) -> None:
         if set(actual) != set(expected):
             raise V10ProtocolError(f"{label} keys differ from the recomputed reward")
         for key, expected_value in expected.items():
-            if not math.isclose(
-                actual[key], expected_value, rel_tol=0.0, abs_tol=1.0e-12
-            ):
-                raise V10ProtocolError(
-                    f"{label}.{key} differs from the recomputed V10 reward"
-                )
+            if not math.isclose(actual[key], expected_value, rel_tol=0.0, abs_tol=1.0e-12):
+                raise V10ProtocolError(f"{label}.{key} differs from the recomputed V10 reward")
 
     def _validated_v10_reward_info(
         self,
@@ -1074,21 +1012,15 @@ class OpenAirCongestionEnv(GymnasiumServer):
         pre_capacity_rows = [dict(row) for row in pre_support.capacity_milli_mbps_by_cell]
         post_capacity_rows = [dict(row) for row in post_support.capacity_milli_mbps_by_cell]
         if pre_capacity_rows != post_capacity_rows:
-            raise V10ProtocolError(
-                "V10 action scope must not change the replay cell-capacity topology"
-            )
-        expected_capacity_total = (
-            candidate_contract.RUNB2_V10_CELL_CAPACITY_MBPS * len(post_capacity_rows)
-        )
+            raise V10ProtocolError("V10 action scope must not change the replay cell-capacity topology")
+        expected_capacity_total = candidate_contract.RUNB2_V10_CELL_CAPACITY_MBPS * len(post_capacity_rows)
         if not math.isclose(
             measurements["cell_capacity_mbps_total"],
             expected_capacity_total,
             rel_tol=0.0,
             abs_tol=1.0e-12,
         ):
-            raise V10ProtocolError(
-                "V10 reward capacity total does not match the bound candidate cells"
-            )
+            raise V10ProtocolError("V10 reward capacity total does not match the bound candidate cells")
         terms = self._finite_mapping(
             step_info.get("reward_terms"),
             label="reward_terms",
@@ -1136,9 +1068,7 @@ class OpenAirCongestionEnv(GymnasiumServer):
             label="reward_measurements",
         )
         self._assert_close_mapping(terms, expected_terms, label="reward_terms")
-        if not math.isclose(
-            float(reward), float(expected_total), rel_tol=0.0, abs_tol=1.0e-12
-        ):
+        if not math.isclose(float(reward), float(expected_total), rel_tol=0.0, abs_tol=1.0e-12):
             raise V10ProtocolError("step scalar reward differs from recomputed V10 reward")
         return measurements, terms, accepted
 
@@ -1173,12 +1103,8 @@ class OpenAirCongestionEnv(GymnasiumServer):
             "action": json.loads(candidate_contract.canonical_json(action)),
             "submitted_action": json.loads(candidate_contract.canonical_json(action)),
             "scalar_reward": float(scalar_reward),
-            "reward_measurements": json.loads(
-                candidate_contract.canonical_json(reward_measurements)
-            ),
-            "reward_measurements_sha256": candidate_contract.canonical_json_sha256(
-                reward_measurements
-            ),
+            "reward_measurements": json.loads(candidate_contract.canonical_json(reward_measurements)),
+            "reward_measurements_sha256": candidate_contract.canonical_json_sha256(reward_measurements),
             "reward_terms": json.loads(candidate_contract.canonical_json(reward_terms)),
             "reward_terms_sha256": candidate_contract.canonical_json_sha256(reward_terms),
             "guardrail_accepted": guardrail_accepted,
@@ -1297,17 +1223,12 @@ class OpenAirCongestionEnv(GymnasiumServer):
     ) -> dict[str, Any]:
         """Return the exact pre/post server receipt consumed by a branch builder."""
 
-        if (
-            pre_support.visible_binding_payload is None
-            or post_support.visible_binding_payload is None
-        ):
+        if pre_support.visible_binding_payload is None or post_support.visible_binding_payload is None:
             raise V10ProtocolError("V10 transition support lost its visible binding")
         pre_capacity_rows = [dict(row) for row in pre_support.capacity_milli_mbps_by_cell]
         post_capacity_rows = [dict(row) for row in post_support.capacity_milli_mbps_by_cell]
         if pre_capacity_rows != post_capacity_rows:
-            raise V10ProtocolError(
-                "V10 transition changed its fixed replay cell-capacity topology"
-            )
+            raise V10ProtocolError("V10 transition changed its fixed replay cell-capacity topology")
         return {
             "schema_version": _V10_TRANSITION_BINDING_SCHEMA,
             "action": json.loads(candidate_contract.canonical_json(action)),
@@ -1315,26 +1236,18 @@ class OpenAirCongestionEnv(GymnasiumServer):
             "launch_contract": self._v10_launch_contract(),
             "task_budget_receipt_sha256": task_budget_receipt_sha256,
             "reset_receipt_sha256": reset_receipt_sha256,
-            "pre_observation_sha256": candidate_contract.text_sha256(
-                pre_support.observation_text
-            ),
+            "pre_observation_sha256": candidate_contract.text_sha256(pre_support.observation_text),
             "pre_candidate_support_sha256": pre_support.support_sha256,
             "pre_binding_payload_sha256": candidate_contract.canonical_json_sha256(
                 pre_support.visible_binding_payload
             ),
             "pre_cell_count": len(pre_capacity_rows),
-            "pre_capacity_milli_mbps_total": sum(
-                row["capacity_milli_mbps"] for row in pre_capacity_rows
-            ),
+            "pre_capacity_milli_mbps_total": sum(row["capacity_milli_mbps"] for row in pre_capacity_rows),
             "post_observation": post_support.observation_text,
-            "post_observation_sha256": candidate_contract.text_sha256(
-                post_support.observation_text
-            ),
+            "post_observation_sha256": candidate_contract.text_sha256(post_support.observation_text),
             "post_candidate_support_sha256": post_support.support_sha256,
             "post_cell_count": len(post_capacity_rows),
-            "post_capacity_milli_mbps_total": sum(
-                row["capacity_milli_mbps"] for row in post_capacity_rows
-            ),
+            "post_capacity_milli_mbps_total": sum(row["capacity_milli_mbps"] for row in post_capacity_rows),
             "post_binding_payload": json.loads(
                 candidate_contract.canonical_json(post_support.visible_binding_payload)
             ),
@@ -1401,9 +1314,7 @@ class OpenAirCongestionEnv(GymnasiumServer):
                 session_id=session_id,
                 state=state,
                 reason=reason,
-                tool_outputs=[
-                    self.tool_output(call, {"accepted": False, "error": reason})
-                ],
+                tool_outputs=[self.tool_output(call, {"accepted": False, "error": reason})],
             )
         if not candidate_contract.is_supported_action(canonical, support):
             reason = "candidate_not_in_pre_step_support"
@@ -1411,17 +1322,13 @@ class OpenAirCongestionEnv(GymnasiumServer):
                 session_id=session_id,
                 state=state,
                 reason=reason,
-                tool_outputs=[
-                    self.tool_output(call, {"accepted": False, "error": reason})
-                ],
+                tool_outputs=[self.tool_output(call, {"accepted": False, "error": reason})],
                 submitted_action=canonical,
             )
 
         tool_call = ToolCall.model_validate(canonical)
         try:
-            next_obs, reward, done, step_info = self.backend.step(
-                state["episode_id"], tool_call
-            )
+            next_obs, reward, done, step_info = self.backend.step(state["episode_id"], tool_call)
         except Exception:
             return await self._quarantine_v10_session(
                 session_id=session_id,
@@ -1452,9 +1359,7 @@ class OpenAirCongestionEnv(GymnasiumServer):
                 support,
                 next_support,
                 action=canonical,
-                task_budget_receipt_sha256=receipt_info[
-                    "task_budget_receipt_sha256"
-                ],
+                task_budget_receipt_sha256=receipt_info["task_budget_receipt_sha256"],
                 reset_receipt_sha256=receipt_info["reset_receipt_sha256"],
             )
         except Exception as exc:
@@ -1489,9 +1394,7 @@ class OpenAirCongestionEnv(GymnasiumServer):
         response_static_info = dict(next_static_info)
         if terminated or truncated:
             response_static_info.pop("server_observation_binding", None)
-        transition_binding_sha256 = candidate_contract.canonical_json_sha256(
-            transition_binding
-        )
+        transition_binding_sha256 = candidate_contract.canonical_json_sha256(transition_binding)
         runtime_manifest_sha256 = self._v10_runtime_manifest_ref()["sha256"]
         launch_contract = self._v10_launch_contract()
         server_step_receipt = self._v10_server_step_receipt(
@@ -1512,9 +1415,7 @@ class OpenAirCongestionEnv(GymnasiumServer):
             reset_receipt_sha256=receipt_info["reset_receipt_sha256"],
             transition_binding_sha256=transition_binding_sha256,
         )
-        server_step_receipt_sha256 = candidate_contract.canonical_json_sha256(
-            server_step_receipt
-        )
+        server_step_receipt_sha256 = candidate_contract.canonical_json_sha256(server_step_receipt)
         info: dict[str, Any] = {
             "tool_outputs": [
                 self.tool_output(
@@ -1577,18 +1478,24 @@ class OpenAirCongestionEnv(GymnasiumServer):
         if state is None:
             # /step without /reset (defensive; gymnasium_agent always resets).
             if self._v10_protocol_enabled:
-                return None, 0.0, False, True, {
-                    "error": "no_active_episode",
-                    "scalar_reward": 0.0,
-                    "protocol_rejection": True,
-                    "guardrail_accepted": False,
-                    "terminated": False,
-                    "truncated": True,
-                    "training_eligible": False,
-                    "rollout_usable": False,
-                    "training_usable": False,
-                    "terminal_quarantine": True,
-                }
+                return (
+                    None,
+                    0.0,
+                    False,
+                    True,
+                    {
+                        "error": "no_active_episode",
+                        "scalar_reward": 0.0,
+                        "protocol_rejection": True,
+                        "guardrail_accepted": False,
+                        "terminated": False,
+                        "truncated": True,
+                        "training_eligible": False,
+                        "rollout_usable": False,
+                        "training_usable": False,
+                        "terminal_quarantine": True,
+                    },
+                )
             return None, 0.0, False, True, {"error": "no_active_episode"}
 
         state["agent_steps"] += 1

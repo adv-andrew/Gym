@@ -48,6 +48,7 @@ from resources_servers.openair_congestion.app import (  # noqa: E402
 from resources_servers.openair_congestion.backends import (  # noqa: E402
     OAICollectorBackend,
     ReplayBackend,
+    V10FixedReplayBackend,
     select_backend,
 )
 
@@ -309,6 +310,7 @@ class TestV10ConstrainedProtocol:
     def _env() -> OpenAirCongestionEnv:
         return _make_env(
             protocol_mode=candidate_contract.RUNB2_V10_PROTOCOL_MODE,
+            replay_scenario_source="fixed_60_mbps_fallback_v2",
             v10_session_secret=_V10_TEST_SESSION_SECRET,
             v10_system_prompt_sha256=_V10_TEST_SYSTEM_PROMPT_SHA256,
             v10_task_manifest_sha256=_V10_TEST_TASK_MANIFEST_SHA256,
@@ -331,13 +333,19 @@ class TestV10ConstrainedProtocol:
         }
         assert info["action_scope"] == candidate_contract.RUNB2_V10_ACTION_SCOPE
         assert set(info["reward_weights"]) == {
-            "w_sla", "w_tput", "w_fair", "w_buffer", "w_sla_level",
-            "w_prb_level", "w_access_level", "w_fair_level", "w_action", "w_reject",
+            "w_sla",
+            "w_tput",
+            "w_fair",
+            "w_buffer",
+            "w_sla_level",
+            "w_prb_level",
+            "w_access_level",
+            "w_fair_level",
+            "w_action",
+            "w_reject",
         }
         assert info["tier"] == "T2"
-        assert parsed.visible_binding_schema == (
-            candidate_contract.RUNB2_V10_VISIBLE_BINDING_SCHEMA
-        )
+        assert parsed.visible_binding_schema == (candidate_contract.RUNB2_V10_VISIBLE_BINDING_SCHEMA)
         assert parsed.visible_binding_sha256 is not None
         binding = info["server_observation_binding"]
         assert set(binding) == {
@@ -384,12 +392,8 @@ class TestV10ConstrainedProtocol:
         assert info["server_runtime_manifest_sha256"] == candidate_contract.canonical_json_sha256(
             info["server_runtime_manifest"]
         )
-        assert "openair_congestion.t2_candidate_sampler" in info[
-            "server_runtime_manifest"
-        ]["source_files"]
-        assert _V10_TEST_SESSION_SECRET not in candidate_contract.canonical_json(
-            info["server_runtime_manifest"]
-        )
+        assert "openair_congestion.t2_candidate_sampler" in info["server_runtime_manifest"]["source_files"]
+        assert _V10_TEST_SESSION_SECRET not in candidate_contract.canonical_json(info["server_runtime_manifest"])
         task_receipt = info["task_budget_receipt"]
         assert task_receipt["schema_version"] == "openair_runb2_v10_task_budget_receipt_v1"
         assert task_receipt["task_params"] == {
@@ -401,38 +405,25 @@ class TestV10ConstrainedProtocol:
             "max_steps": 4,
         }
         assert task_receipt["requested_max_steps"] == 4
-        assert task_receipt["runtime_manifest_sha256"] == info[
-            "server_runtime_manifest_sha256"
-        ]
+        assert task_receipt["runtime_manifest_sha256"] == info["server_runtime_manifest_sha256"]
         assert task_receipt["launch_contract"] == info["v10_launch_contract"]
-        assert info["task_budget_receipt_sha256"] == candidate_contract.canonical_json_sha256(
-            task_receipt
-        )
+        assert info["task_budget_receipt_sha256"] == candidate_contract.canonical_json_sha256(task_receipt)
         reset_receipt = info["reset_receipt"]
         assert reset_receipt["schema_version"] == "openair_runb2_v10_reset_receipt_v1"
-        assert reset_receipt["task_budget_receipt_sha256"] == info[
-            "task_budget_receipt_sha256"
-        ]
-        assert reset_receipt["initial_observation_sha256"] == candidate_contract.text_sha256(
-            observation
-        )
+        assert reset_receipt["task_budget_receipt_sha256"] == info["task_budget_receipt_sha256"]
+        assert reset_receipt["initial_observation_sha256"] == candidate_contract.text_sha256(observation)
         assert reset_receipt["initial_candidate_support_sha256"] == parsed.support_sha256
         assert reset_receipt["initial_binding_payload_sha256"] == candidate_contract.canonical_json_sha256(
             binding["binding_payload"]
         )
-        assert info["reset_receipt_sha256"] == candidate_contract.canonical_json_sha256(
-            reset_receipt
-        )
+        assert info["reset_receipt_sha256"] == candidate_contract.canonical_json_sha256(reset_receipt)
         assert binding["binding_payload"]["candidate_capacity_milli_mbps_by_cell"] == [
             {"cell_id": row["cell_id"], "capacity_milli_mbps": 60_000}
             for row in binding["binding_payload"]["candidate_capacity_milli_mbps_by_cell"]
         ]
-        assert parsed.visible_binding_sha256 == candidate_contract.canonical_json_sha256(
-            binding["binding_payload"]
-        )
+        assert parsed.visible_binding_sha256 == candidate_contract.canonical_json_sha256(binding["binding_payload"])
         assert observation.rsplit("\n", 1)[1] == (
-            f"V10B|{candidate_contract.RUNB2_V10_VISIBLE_BINDING_SCHEMA}|"
-            f"{parsed.visible_binding_sha256}"
+            f"V10B|{candidate_contract.RUNB2_V10_VISIBLE_BINDING_SCHEMA}|{parsed.visible_binding_sha256}"
         )
         assert sum(line.startswith("V10B|") for line in observation.split("\n")) == 1
 
@@ -457,9 +448,7 @@ class TestV10ConstrainedProtocol:
         assert info["action"] == action
         assert info["scalar_reward"] == pytest.approx(reward)
         assert info["reward_terms"]["total"] == pytest.approx(reward)
-        assert sum(
-            value for key, value in info["reward_terms"].items() if key != "total"
-        ) == pytest.approx(reward)
+        assert sum(value for key, value in info["reward_terms"].items() if key != "total") == pytest.approx(reward)
         assert all(math.isfinite(value) for value in info["reward_measurements"].values())
         assert info["training_eligible"] is True
         assert info["rollout_usable"] is True
@@ -500,30 +489,21 @@ class TestV10ConstrainedProtocol:
         assert receipt["reward_measurements_sha256"] == candidate_contract.canonical_json_sha256(
             receipt["reward_measurements"]
         )
-        assert receipt["reward_terms_sha256"] == candidate_contract.canonical_json_sha256(
-            receipt["reward_terms"]
-        )
+        assert receipt["reward_terms_sha256"] == candidate_contract.canonical_json_sha256(receipt["reward_terms"])
         assert receipt["reward_weights"] == info["reward_weights"]
         assert receipt["dynamics_mode"] == info["dynamics_mode"]
-        assert receipt["submitted_candidate_support_sha256"] == reset_info[
-            "candidate_support_sha256"
-        ]
+        assert receipt["submitted_candidate_support_sha256"] == reset_info["candidate_support_sha256"]
         assert receipt["training_usable"] is True
-        assert receipt["runtime_manifest_sha256"] == reset_info[
-            "server_runtime_manifest_sha256"
-        ]
+        assert receipt["runtime_manifest_sha256"] == reset_info["server_runtime_manifest_sha256"]
         assert receipt["launch_contract"] == reset_info["v10_launch_contract"]
-        assert receipt["task_budget_receipt_sha256"] == reset_info[
-            "task_budget_receipt_sha256"
-        ]
+        assert receipt["task_budget_receipt_sha256"] == reset_info["task_budget_receipt_sha256"]
         assert receipt["reset_receipt_sha256"] == reset_info["reset_receipt_sha256"]
-        assert info["server_step_receipt_sha256"] == candidate_contract.canonical_json_sha256(
-            receipt
-        )
+        assert info["server_step_receipt_sha256"] == candidate_contract.canonical_json_sha256(receipt)
         assert next_observation is not None
-        assert candidate_contract.parse_rendered_support(next_observation).support_sha256 == info[
-            "candidate_support_sha256"
-        ]
+        assert (
+            candidate_contract.parse_rendered_support(next_observation).support_sha256
+            == info["candidate_support_sha256"]
+        )
         assert info["server_observation_binding"]["observation_sha256"] == (
             candidate_contract.text_sha256(next_observation)
         )
@@ -549,38 +529,26 @@ class TestV10ConstrainedProtocol:
         }
         assert transition["schema_version"] == "openair_runb2_v10_transition_binding_v2"
         assert transition["action"] == action
-        assert transition["runtime_manifest_sha256"] == reset_info[
-            "server_runtime_manifest_sha256"
-        ]
+        assert transition["runtime_manifest_sha256"] == reset_info["server_runtime_manifest_sha256"]
         assert transition["launch_contract"] == reset_info["v10_launch_contract"]
-        assert transition["task_budget_receipt_sha256"] == reset_info[
-            "task_budget_receipt_sha256"
-        ]
+        assert transition["task_budget_receipt_sha256"] == reset_info["task_budget_receipt_sha256"]
         assert transition["reset_receipt_sha256"] == reset_info["reset_receipt_sha256"]
-        assert info["server_transition_binding_sha256"] == candidate_contract.canonical_json_sha256(
-            transition
-        )
-        assert receipt["transition_binding_sha256"] == info[
-            "server_transition_binding_sha256"
-        ]
+        assert info["server_transition_binding_sha256"] == candidate_contract.canonical_json_sha256(transition)
+        assert receipt["transition_binding_sha256"] == info["server_transition_binding_sha256"]
         assert transition["pre_observation_sha256"] == candidate_contract.text_sha256(observation)
-        assert transition["pre_candidate_support_sha256"] == reset_info[
-            "candidate_support_sha256"
-        ]
+        assert transition["pre_candidate_support_sha256"] == reset_info["candidate_support_sha256"]
         assert transition["post_observation"] == next_observation
-        assert transition["post_observation_sha256"] == candidate_contract.text_sha256(
-            next_observation
-        )
-        assert transition["post_binding_payload"] == info[
-            "server_observation_binding"
-        ]["binding_payload"]
+        assert transition["post_observation_sha256"] == candidate_contract.text_sha256(next_observation)
+        assert transition["post_binding_payload"] == info["server_observation_binding"]["binding_payload"]
         assert transition["post_binding_payload"][
             "observation_without_binding_sha256"
         ] == candidate_contract.text_sha256(next_observation.rsplit("\n", 1)[0])
         assert transition["pre_cell_count"] == transition["post_cell_count"]
-        assert transition["pre_capacity_milli_mbps_total"] == transition[
-            "post_capacity_milli_mbps_total"
-        ] == 60_000 * transition["post_cell_count"]
+        assert (
+            transition["pre_capacity_milli_mbps_total"]
+            == transition["post_capacity_milli_mbps_total"]
+            == 60_000 * transition["post_cell_count"]
+        )
         assert info["reward_measurements"]["cell_capacity_mbps_total"] == pytest.approx(
             60.0 * transition["post_cell_count"]
         )
@@ -660,9 +628,7 @@ class TestV10ConstrainedProtocol:
         _, _, _, _, acted = await acting.step(
             _tool_response(action["name"], action["arguments"]), {}, session_id="acting"
         )
-        _, _, _, _, nooped = await baseline.step(
-            _tool_response("noop", {}), {}, session_id="baseline"
-        )
+        _, _, _, _, nooped = await baseline.step(_tool_response("noop", {}), {}, session_id="baseline")
         assert acted["guardrail_accepted"] is True
         assert acted["prb_cap_dynamics"]
         assert acted["reward_measurements"]["aggregate_delivered_mbps"] != pytest.approx(
@@ -673,18 +639,10 @@ class TestV10ConstrainedProtocol:
     async def test_v10_reset_metadata_is_a_deep_copy_not_authoritative_state(self):
         env = self._env()
         _, info = await env.reset(dict(_V10_TASK_METADATA), session_id="sid")
-        index = next(
-            i
-            for i, action in enumerate(info["candidate_actions"])
-            if action["name"] == "set_prb_cap"
-        )
-        original = dict(
-            env.session_state["sid"]["candidate_support"].actions[index]["arguments"]
-        )
+        index = next(i for i, action in enumerate(info["candidate_actions"]) if action["name"] == "set_prb_cap")
+        original = dict(env.session_state["sid"]["candidate_support"].actions[index]["arguments"])
         info["candidate_actions"][index]["arguments"]["max_prb"] = 1
-        assert env.session_state["sid"]["candidate_support"].actions[index][
-            "arguments"
-        ] == original
+        assert env.session_state["sid"]["candidate_support"].actions[index]["arguments"] == original
 
     @pytest.mark.asyncio
     async def test_v10_rejects_ambiguous_or_incomplete_task_row_before_opening(self):
@@ -758,6 +716,7 @@ class TestV10ConstrainedProtocol:
         with pytest.raises(RuntimeError, match="requires backend='replay'"):
             _make_env(
                 protocol_mode=candidate_contract.RUNB2_V10_PROTOCOL_MODE,
+                replay_scenario_source="fixed_60_mbps_fallback_v2",
                 v10_session_secret=_V10_TEST_SESSION_SECRET,
                 v10_system_prompt_sha256=_V10_TEST_SYSTEM_PROMPT_SHA256,
                 v10_task_manifest_sha256=_V10_TEST_TASK_MANIFEST_SHA256,
@@ -776,6 +735,7 @@ class TestV10ConstrainedProtocol:
             ({"num_workers": 2}, "requires exactly one FastAPI worker"),
             ({"host": "0.0.0.0"}, "requires an in-process test host or a loopback host"),
             ({"entrypoint": "serve.py"}, "requires the bound app.py entrypoint"),
+            ({"replay_scenario_source": "auto"}, "'auto' is forbidden"),
             ({"cell_capacity_mbps": 59.0}, "fixes cell_capacity_mbps at 60.0"),
             ({"candidate_cell_capacity_mbps": 60.0}, "was removed for V10"),
             ({"v10_max_steps": 17}, "v10_max_steps must be a positive integer"),
@@ -785,6 +745,7 @@ class TestV10ConstrainedProtocol:
     def test_v10_refuses_unsafe_launch_configuration(self, overrides, error):
         config = {
             "protocol_mode": candidate_contract.RUNB2_V10_PROTOCOL_MODE,
+            "replay_scenario_source": "fixed_60_mbps_fallback_v2",
             "v10_session_secret": _V10_TEST_SESSION_SECRET,
             "v10_system_prompt_sha256": _V10_TEST_SYSTEM_PROMPT_SHA256,
             "v10_task_manifest_sha256": _V10_TEST_TASK_MANIFEST_SHA256,
@@ -798,13 +759,17 @@ class TestV10ConstrainedProtocol:
         with pytest.raises(RuntimeError, match="OPENAIR_CONGESTION_BACKEND"):
             self._env()
 
-    def test_v10_refuses_dynamic_congestion_generator(self, monkeypatch):
+    def test_v10_attests_importable_generator_but_keeps_it_disabled(self, monkeypatch):
         monkeypatch.setattr(
             "resources_servers.openair_congestion.app.importlib.util.find_spec",
             lambda _name: object(),
         )
-        with pytest.raises(RuntimeError, match="fixed 60-Mbps fallback replay source"):
-            self._env()
+        env = self._env()
+        config = env._v10_runtime_manifest["effective_public_config"]
+        assert config["dynamic_congestion_gen_importable"] is True
+        assert config["dynamic_congestion_gen_configured"] is False
+        assert config["dynamic_congestion_gen_used"] is False
+        assert config["scenario_source"] == "fixed_60_mbps_fallback_v2"
 
     @pytest.mark.asyncio
     async def test_v10_requires_explicit_bounded_task_max_steps(self):
@@ -1026,6 +991,7 @@ class TestHTTPSurface:
     async def test_v10_http_cookie_contract_binds_the_pre_step_support(self):
         env = _make_env(
             protocol_mode=candidate_contract.RUNB2_V10_PROTOCOL_MODE,
+            replay_scenario_source="fixed_60_mbps_fallback_v2",
             v10_session_secret=_V10_TEST_SESSION_SECRET,
             v10_system_prompt_sha256=_V10_TEST_SYSTEM_PROMPT_SHA256,
             v10_task_manifest_sha256=_V10_TEST_TASK_MANIFEST_SHA256,
@@ -1057,7 +1023,32 @@ class TestBackends:
     def test_select_backend_defaults_to_replay(self, monkeypatch):
         monkeypatch.delenv("OPENAIR_CONGESTION_BACKEND", raising=False)
         config = OpenAirCongestionResourcesServerConfig(host="", port=0, entrypoint="", name="")
-        assert isinstance(select_backend(config), ReplayBackend)
+        backend = select_backend(config)
+        assert isinstance(backend, ReplayBackend)
+        assert not isinstance(backend, V10FixedReplayBackend)
+
+    def test_select_backend_uses_fixed_replay_only_when_explicit(self, monkeypatch):
+        monkeypatch.delenv("OPENAIR_CONGESTION_BACKEND", raising=False)
+        config = OpenAirCongestionResourcesServerConfig(
+            host="",
+            port=0,
+            entrypoint="",
+            name="",
+            replay_scenario_source="fixed_60_mbps_fallback_v2",
+        )
+        assert isinstance(select_backend(config), V10FixedReplayBackend)
+
+    def test_select_backend_rejects_unknown_replay_source(self, monkeypatch):
+        monkeypatch.delenv("OPENAIR_CONGESTION_BACKEND", raising=False)
+        config = OpenAirCongestionResourcesServerConfig(
+            host="",
+            port=0,
+            entrypoint="",
+            name="",
+            replay_scenario_source="ambient_plugin",
+        )
+        with pytest.raises(ValueError, match="unknown replay_scenario_source"):
+            select_backend(config)
 
     def test_select_backend_rejects_unknown_name(self, monkeypatch):
         monkeypatch.delenv("OPENAIR_CONGESTION_BACKEND", raising=False)

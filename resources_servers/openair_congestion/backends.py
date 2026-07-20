@@ -71,6 +71,10 @@ except ImportError as exc:  # pragma: no cover - exercised only when unpackaged
 
 from openair_congestion.replay_env import ReplayEnv  # noqa: E402
 from openair_congestion.schemas import EpisodeMeta, Observation, ToolCall  # noqa: E402
+from openair_congestion.v10_fixed_replay import (  # noqa: E402
+    V10_FIXED_REPLAY_SCENARIO_SOURCE,
+    V10FixedReplayEnv,
+)
 
 
 class TelemetryDriver(Protocol):
@@ -199,6 +203,30 @@ class ReplayBackend(Backend):
         return self._env.close(episode_id)
 
 
+class V10FixedReplayBackend(ReplayBackend):
+    """Replay driver whose scenario builder cannot import ``congestion_gen``."""
+
+    def __init__(
+        self,
+        *,
+        replay_root: str = "data/replay",
+        pool_size: int = 32,
+        max_steps_default: int = 60,
+    ) -> None:
+        self._env = V10FixedReplayEnv(
+            replay_root=replay_root,
+            pool_size=pool_size,
+            max_steps_default=max_steps_default,
+        )
+        self._open_episode_ids: set[str] = set()
+        self._track_lock = threading.Lock()
+
+    def scenario_source_evidence(self) -> dict[str, Any]:
+        """Expose the fixed env's immutable source/runtime-use evidence."""
+
+        return self._env.scenario_source_evidence()
+
+
 class OAICollectorBackend(Backend):
     """Live 5G RAN KPI collection from the OAI docker stack (stub; wiring
     deferred until lab access).
@@ -268,10 +296,20 @@ def select_backend(config: Any) -> Backend:
     name = os.environ.get("OPENAIR_CONGESTION_BACKEND") or getattr(config, "backend", None) or "replay"
     name = name.strip().lower()
     if name == "replay":
-        return ReplayBackend(
-            replay_root=getattr(config, "replay_root", "data/replay"),
-            pool_size=getattr(config, "pool_size", 32),
-            max_steps_default=getattr(config, "max_steps_default", 60),
+        common = {
+            "replay_root": getattr(config, "replay_root", "data/replay"),
+            "pool_size": getattr(config, "pool_size", 32),
+            "max_steps_default": getattr(config, "max_steps_default", 60),
+        }
+        scenario_source = getattr(config, "replay_scenario_source", "auto")
+        if scenario_source == "auto":
+            return ReplayBackend(**common)
+        if scenario_source == V10_FIXED_REPLAY_SCENARIO_SOURCE:
+            return V10FixedReplayBackend(**common)
+        raise ValueError(
+            "unknown replay_scenario_source "
+            f"{scenario_source!r}; expected 'auto' or "
+            f"{V10_FIXED_REPLAY_SCENARIO_SOURCE!r}"
         )
     if name == "dataset_replay":
         # Local import so the default replay path never pays for (or fails
@@ -300,6 +338,4 @@ def select_backend(config: Any) -> Backend:
             scenario_mode=getattr(config, "scenario_mode", None),
             max_steps_default=getattr(config, "max_steps_default", 60),
         )
-    raise ValueError(
-        f"unknown backend {name!r}; valid: 'replay', 'dataset_replay', 'oai_collector'"
-    )
+    raise ValueError(f"unknown backend {name!r}; valid: 'replay', 'dataset_replay', 'oai_collector'")
