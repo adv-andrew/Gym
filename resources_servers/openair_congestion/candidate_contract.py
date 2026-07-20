@@ -30,19 +30,17 @@ from openair_congestion.t2_action_mask import derive_t2_visible_action_set_from_
 
 RESOURCE_CANDIDATE_CONTRACT = "resource_candidate_pipe_v1"
 RUNB2_V10_PROTOCOL_MODE = "runb2_v10_t2_prb_v1"
-RUNB2_V10_ACTION_EFFECT_CONTRACT_SCHEMA = (
-    "openair_runb2_v10_action_effect_source_contract_v1"
-)
+RUNB2_V10_ACTION_EFFECT_CONTRACT_SCHEMA = "openair_runb2_v10_action_effect_source_contract_v1"
 RUNB2_V10_ACTION_SCOPE = "t2_prb_only_synthetic_replay_v1"
 RUNB2_V10_OBSERVATION_RENDER = RESOURCE_CANDIDATE_CONTRACT
 RUNB2_V10_REWARD_PROFILE = "openair_v1"
 RESOURCE_ACTION_ARGUMENT_CONTRACT = "resource_candidate_ue_prb_200_273_v1"
 # V10 deliberately has no caller-selectable capacity normalizer.  The replay
-# environment's T2 source contract fixes it at 60 Mbps per cell; carrying a
+# environment's T2 generator contract fixes it at 250 Mbps per cell; carrying a
 # second knob in the resource server would let the visible candidate contract
 # disagree with the causal reward/dynamics source.
-RUNB2_V10_CELL_CAPACITY_MBPS = 60.0
-RUNB2_V10_CELL_CAPACITY_MILLI_MBPS = 60_000
+RUNB2_V10_CELL_CAPACITY_MBPS = 250.0
+RUNB2_V10_CELL_CAPACITY_MILLI_MBPS = 250_000
 RUNB2_V10_CAPACITY_UNIT = "milli_mbps"
 RUNB2_V10_MAX_STEPS_HARD_CAP = 16
 
@@ -51,11 +49,9 @@ RUNB2_V10_MAX_STEPS_HARD_CAP = 16
 # support rendered alongside it.  The payload itself travels in response
 # provenance; placing it verbatim in the prompt would create needless token
 # pressure and duplicate a server-authored receipt.
-RUNB2_V10_VISIBLE_BINDING_SCHEMA = (
-    "openair_runb2_v10_server_observation_binding_v3"
-)
+RUNB2_V10_VISIBLE_BINDING_SCHEMA = "openair_runb2_v10_server_observation_binding_v3"
 RUNB2_V10_VISIBLE_BINDING_PREFIX = "V10B"
-RUNB2_V10_RUNTIME_MANIFEST_SCHEMA = "openair_runb2_v10_runtime_manifest_v1"
+RUNB2_V10_RUNTIME_MANIFEST_SCHEMA = "openair_runb2_v10_runtime_manifest_v2"
 RUNB2_V10_LAUNCH_CONTRACT_SCHEMA = "openair_runb2_v10_launch_contract_v1"
 
 _VISIBLE_BINDING_KEYS = frozenset(
@@ -112,9 +108,7 @@ def canonical_json(value: Any) -> str:
 def _reject_json_constant(value: str) -> None:
     """Reject non-JSON numeric spellings such as ``NaN`` and ``Infinity``."""
 
-    raise CandidateContractError(
-        f"JSON contains unsupported non-finite constant {value!r}"
-    )
+    raise CandidateContractError(f"JSON contains unsupported non-finite constant {value!r}")
 
 
 def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -195,26 +189,17 @@ def _validate_action(action: Mapping[str, Any]) -> None:
         "max_prb",
     }:
         raise CandidateContractError(
-            "set_prb_cap candidate arguments must contain exactly cell_id, target, "
-            "target_id, and max_prb"
+            "set_prb_cap candidate arguments must contain exactly cell_id, target, target_id, and max_prb"
         )
     if arguments["target"] != "ue":
         raise CandidateContractError("set_prb_cap candidate target must be 'ue'")
     for field_name in ("cell_id", "target_id"):
         value = arguments[field_name]
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-            raise CandidateContractError(
-                f"set_prb_cap candidate {field_name} must be a nonnegative integer"
-            )
+            raise CandidateContractError(f"set_prb_cap candidate {field_name} must be a nonnegative integer")
     max_prb = arguments["max_prb"]
-    if (
-        not isinstance(max_prb, int)
-        or isinstance(max_prb, bool)
-        or not 200 <= max_prb <= 273
-    ):
-        raise CandidateContractError(
-            "set_prb_cap candidate max_prb must be an integer in [200,273]"
-        )
+    if not isinstance(max_prb, int) or isinstance(max_prb, bool) or not 200 <= max_prb <= 273:
+        raise CandidateContractError("set_prb_cap candidate max_prb must be an integer in [200,273]")
 
 
 def action_key(action: ToolCall | Mapping[str, Any]) -> str:
@@ -245,9 +230,7 @@ def canonical_support_payload(
             "cell_id",
             "capacity_milli_mbps",
         }:
-            raise CandidateContractError(
-                f"capacity row {index} must contain cell_id and capacity_milli_mbps"
-            )
+            raise CandidateContractError(f"capacity row {index} must contain cell_id and capacity_milli_mbps")
         cell_id = raw["cell_id"]
         capacity = raw["capacity_milli_mbps"]
         if (
@@ -258,9 +241,7 @@ def canonical_support_payload(
             or isinstance(capacity, bool)
             or capacity <= 0
         ):
-            raise CandidateContractError(
-                f"capacity row {index} contains invalid integer values"
-            )
+            raise CandidateContractError(f"capacity row {index} contains invalid integer values")
         capacities.append({"cell_id": cell_id, "capacity_milli_mbps": capacity})
     if not capacities:
         raise CandidateContractError("resource candidate support requires cell capacities")
@@ -275,9 +256,7 @@ def canonical_support_payload(
         if action["name"] == "set_prb_cap" and action["arguments"]["cell_id"] not in known_cells
     )
     if unknown_cells:
-        raise CandidateContractError(
-            f"resource candidates reference cells without capacity rows: {unknown_cells}"
-        )
+        raise CandidateContractError(f"resource candidates reference cells without capacity rows: {unknown_cells}")
     return {
         "contract": RESOURCE_CANDIDATE_CONTRACT,
         "capacity_milli_mbps_by_cell": capacities,
@@ -321,14 +300,10 @@ class CandidateSupport:
             "candidate_action_argument_contract": RESOURCE_ACTION_ARGUMENT_CONTRACT,
             # Return a deep canonical copy.  A shallow ``dict(action)`` leaves
             # nested ``arguments`` mutable outside the server's support state.
-            "candidate_actions": [
-                json.loads(canonical_json(action)) for action in self.actions
-            ],
+            "candidate_actions": [json.loads(canonical_json(action)) for action in self.actions],
             "candidate_support_sha256": self.support_sha256,
             "visible_action_support_sha256": self.support_sha256,
-            "candidate_capacity_milli_mbps_by_cell": [
-                dict(row) for row in self.capacity_milli_mbps_by_cell
-            ],
+            "candidate_capacity_milli_mbps_by_cell": [dict(row) for row in self.capacity_milli_mbps_by_cell],
             "observation_render": RUNB2_V10_OBSERVATION_RENDER,
         }
         if self.visible_binding_payload is not None:
@@ -357,17 +332,12 @@ def _canonical_mapping_copy(value: Any, *, label: str) -> dict[str, Any]:
     return copied
 
 
-def _require_exact_mapping(
-    value: Any, *, label: str, keys: frozenset[str]
-) -> dict[str, Any]:
+def _require_exact_mapping(value: Any, *, label: str, keys: frozenset[str]) -> dict[str, Any]:
     mapping = _canonical_mapping_copy(value, label=label)
     if set(mapping) != keys:
         missing = sorted(keys - set(mapping))
         extra = sorted(set(mapping) - keys)
-        raise CandidateContractError(
-            f"{label} fields differ from the V10 contract "
-            f"(missing={missing}, extra={extra})"
-        )
+        raise CandidateContractError(f"{label} fields differ from the V10 contract (missing={missing}, extra={extra})")
     return mapping
 
 
@@ -434,9 +404,7 @@ def build_visible_binding_payload(
             label="launch_contract",
         ),
         "candidate_support_sha256": support.support_sha256,
-        "candidate_capacity_milli_mbps_by_cell": [
-            dict(row) for row in support.capacity_milli_mbps_by_cell
-        ],
+        "candidate_capacity_milli_mbps_by_cell": [dict(row) for row in support.capacity_milli_mbps_by_cell],
         # Hash the exact prompt bytes before the final V10B line is appended.
         # This makes the V10B digest commit to the policy-visible observation
         # while avoiding a circular hash over the line that carries that digest.
@@ -445,9 +413,7 @@ def build_visible_binding_payload(
     return validate_visible_binding_payload(payload, support=support)
 
 
-def validate_visible_binding_payload(
-    value: Any, *, support: CandidateSupport
-) -> dict[str, Any]:
+def validate_visible_binding_payload(value: Any, *, support: CandidateSupport) -> dict[str, Any]:
     """Fail closed unless a V10B payload exactly matches its RCP support."""
 
     payload = _require_exact_mapping(
@@ -465,9 +431,7 @@ def validate_visible_binding_payload(
     }
     for key, expected in expected_static.items():
         if payload[key] != expected:
-            raise CandidateContractError(
-                f"V10 visible binding {key} does not match the server contract"
-            )
+            raise CandidateContractError(f"V10 visible binding {key} does not match the server contract")
 
     environment = _require_exact_mapping(
         payload["environment_contract"],
@@ -490,9 +454,7 @@ def validate_visible_binding_payload(
         or not isinstance(environment["dynamics_mode"], str)
         or not environment["dynamics_mode"]
     ):
-        raise CandidateContractError(
-            "V10 visible binding environment_contract does not match replay"
-        )
+        raise CandidateContractError("V10 visible binding environment_contract does not match replay")
 
     reward = _require_exact_mapping(
         payload["reward_contract"],
@@ -521,14 +483,8 @@ def validate_visible_binding_payload(
         keys=expected_weight_keys,
     )
     for key, raw in weights.items():
-        if (
-            not isinstance(raw, (int, float))
-            or isinstance(raw, bool)
-            or not math.isfinite(float(raw))
-        ):
-            raise CandidateContractError(
-                f"V10 visible binding reward weight {key} must be finite"
-            )
+        if not isinstance(raw, (int, float)) or isinstance(raw, bool) or not math.isfinite(float(raw)):
+            raise CandidateContractError(f"V10 visible binding reward weight {key} must be finite")
 
     capacity = _require_exact_mapping(
         payload["capacity_contract"],
@@ -537,10 +493,13 @@ def validate_visible_binding_payload(
     )
     if capacity["unit"] != RUNB2_V10_CAPACITY_UNIT:
         raise CandidateContractError("V10 visible binding capacity unit is wrong")
-    if _require_finite_positive_float(
-        capacity["candidate_cell_capacity_mbps"],
-        label="V10 visible binding candidate_cell_capacity_mbps",
-    ) != RUNB2_V10_CELL_CAPACITY_MBPS:
+    if (
+        _require_finite_positive_float(
+            capacity["candidate_cell_capacity_mbps"],
+            label="V10 visible binding candidate_cell_capacity_mbps",
+        )
+        != RUNB2_V10_CELL_CAPACITY_MBPS
+    ):
         raise CandidateContractError("V10 visible binding capacity is not pinned to replay")
 
     runtime_manifest = _require_exact_mapping(
@@ -550,9 +509,7 @@ def validate_visible_binding_payload(
     )
     if runtime_manifest["schema_version"] != RUNB2_V10_RUNTIME_MANIFEST_SCHEMA:
         raise CandidateContractError("V10 visible binding runtime manifest schema is wrong")
-    _require_sha256(
-        runtime_manifest["sha256"], label="V10 visible binding runtime manifest SHA"
-    )
+    _require_sha256(runtime_manifest["sha256"], label="V10 visible binding runtime manifest SHA")
 
     launch_contract = _require_exact_mapping(
         payload["launch_contract"],
@@ -572,25 +529,14 @@ def validate_visible_binding_payload(
 
     if payload["candidate_support_sha256"] != support.support_sha256:
         raise CandidateContractError("V10 visible binding support SHA does not match RCP")
-    if payload["observation_without_binding_sha256"] != text_sha256(
-        support.observation_text
-    ):
-        raise CandidateContractError(
-            "V10 visible binding observation SHA does not match pre-binding text"
-        )
+    if payload["observation_without_binding_sha256"] != text_sha256(support.observation_text):
+        raise CandidateContractError("V10 visible binding observation SHA does not match pre-binding text")
     capacity_rows = payload["candidate_capacity_milli_mbps_by_cell"]
     expected_rows = [dict(row) for row in support.capacity_milli_mbps_by_cell]
     if capacity_rows != expected_rows:
-        raise CandidateContractError(
-            "V10 visible binding capacity rows do not match RCP support"
-        )
-    if any(
-        row["capacity_milli_mbps"] != RUNB2_V10_CELL_CAPACITY_MILLI_MBPS
-        for row in expected_rows
-    ):
-        raise CandidateContractError(
-            "V10 visible binding capacity rows are not pinned to 60000 milli_mbps"
-        )
+        raise CandidateContractError("V10 visible binding capacity rows do not match RCP support")
+    if any(row["capacity_milli_mbps"] != RUNB2_V10_CELL_CAPACITY_MILLI_MBPS for row in expected_rows):
+        raise CandidateContractError("V10 visible binding capacity rows are not pinned to 250000 milli_mbps")
     # Revalidate rows through the same strict support serializer, including
     # sort/order/type checks, without giving the payload an alternate action
     # source of truth.
@@ -601,20 +547,13 @@ def validate_visible_binding_payload(
     return payload
 
 
-def attach_visible_binding(
-    support: CandidateSupport, *, binding_payload: Mapping[str, Any]
-) -> CandidateSupport:
+def attach_visible_binding(support: CandidateSupport, *, binding_payload: Mapping[str, Any]) -> CandidateSupport:
     """Append the exact V10B line after a validated RCP/RCC/RCA block."""
 
     if support.visible_binding_schema is not None or support.visible_binding_sha256 is not None:
         raise CandidateContractError("V10 candidate support already has a visible binding")
-    if any(
-        line.startswith(f"{RUNB2_V10_VISIBLE_BINDING_PREFIX}|")
-        for line in support.observation_text.splitlines()
-    ):
-        raise CandidateContractError(
-            "pre-binding V10 candidate support must not already contain a V10B row"
-        )
+    if any(line.startswith(f"{RUNB2_V10_VISIBLE_BINDING_PREFIX}|") for line in support.observation_text.splitlines()):
+        raise CandidateContractError("pre-binding V10 candidate support must not already contain a V10B row")
     payload = validate_visible_binding_payload(binding_payload, support=support)
     digest = canonical_json_sha256(payload)
     line = f"{RUNB2_V10_VISIBLE_BINDING_PREFIX}|{RUNB2_V10_VISIBLE_BINDING_SCHEMA}|{digest}"
@@ -624,9 +563,7 @@ def attach_visible_binding(
     # cannot quietly move/duplicate it.
     rendered_lines = observation_text.split("\n")
     binding_rows = [
-        index
-        for index, row in enumerate(rendered_lines)
-        if row.startswith(f"{RUNB2_V10_VISIBLE_BINDING_PREFIX}|")
+        index for index, row in enumerate(rendered_lines) if row.startswith(f"{RUNB2_V10_VISIBLE_BINDING_PREFIX}|")
     ]
     if binding_rows != [len(rendered_lines) - 1]:
         raise CandidateContractError("V10B row must occur exactly once as the final line")
@@ -652,8 +589,14 @@ def build_t2_prb_support(observation: Observation) -> CandidateSupport:
 
     if observation.global_.tier.upper() != "T2":
         raise CandidateContractError("V10 candidate support requires a T2 observation")
-    policy_text = render.to_compact_user_text(observation)
-    visible = derive_t2_visible_action_set_from_text(policy_text)
+    policy_text = render.to_compact_user_text(
+        observation,
+        capacity_milli_mbps=RUNB2_V10_CELL_CAPACITY_MILLI_MBPS,
+    )
+    visible = derive_t2_visible_action_set_from_text(
+        policy_text,
+        capacity_milli_mbps=RUNB2_V10_CELL_CAPACITY_MILLI_MBPS,
+    )
     actions = tuple(canonical_action(action) for action in visible.actions)
     capacities = tuple(
         {
@@ -670,10 +613,7 @@ def build_t2_prb_support(observation: Observation) -> CandidateSupport:
     lines = [
         policy_text,
         f"RCP|{RESOURCE_CANDIDATE_CONTRACT}|{digest}|{len(actions)}",
-        *(
-            f"RCC|{row['cell_id']}|{row['capacity_milli_mbps']}"
-            for row in capacities
-        ),
+        *(f"RCC|{row['cell_id']}|{row['capacity_milli_mbps']}" for row in capacities),
         *(f"RCA|{index}|{canonical_json(action)}" for index, action in enumerate(actions)),
     ]
     return CandidateSupport(
@@ -695,9 +635,7 @@ def parse_rendered_support(observation_text: str) -> CandidateSupport:
     if not isinstance(observation_text, str) or not observation_text:
         raise CandidateContractError("candidate observation must be non-empty text")
     lines = observation_text.splitlines()
-    rcp_indices = [
-        index for index, line in enumerate(lines) if line.startswith("RCP|")
-    ]
+    rcp_indices = [index for index, line in enumerate(lines) if line.startswith("RCP|")]
     if len(rcp_indices) != 1:
         raise CandidateContractError("observation must contain exactly one RCP row")
     rcp_index = rcp_indices[0]
@@ -713,9 +651,7 @@ def parse_rendered_support(observation_text: str) -> CandidateSupport:
     if count < 1 or str(count) != header[3]:
         raise CandidateContractError("RCP candidate count must be canonical and positive")
     binding_indices = [
-        index
-        for index, line in enumerate(lines)
-        if line.startswith(f"{RUNB2_V10_VISIBLE_BINDING_PREFIX}|")
+        index for index, line in enumerate(lines) if line.startswith(f"{RUNB2_V10_VISIBLE_BINDING_PREFIX}|")
     ]
     if len(binding_indices) > 1:
         raise CandidateContractError("observation must contain at most one V10B row")
@@ -748,19 +684,13 @@ def parse_rendered_support(observation_text: str) -> CandidateSupport:
             fields = line.split("|")
             capacity_index = len(capacities)
             if len(fields) != 3:
-                raise CandidateContractError(
-                    f"RCC row {capacity_index} has invalid field count"
-                )
+                raise CandidateContractError(f"RCC row {capacity_index} has invalid field count")
             try:
                 cell_id, capacity = int(fields[1]), int(fields[2])
             except ValueError as exc:
-                raise CandidateContractError(
-                    f"RCC row {capacity_index} must contain integers"
-                ) from exc
+                raise CandidateContractError(f"RCC row {capacity_index} must contain integers") from exc
             if str(cell_id) != fields[1] or str(capacity) != fields[2]:
-                raise CandidateContractError(
-                    f"RCC row {capacity_index} is not canonical"
-                )
+                raise CandidateContractError(f"RCC row {capacity_index} is not canonical")
             capacities.append({"cell_id": cell_id, "capacity_milli_mbps": capacity})
         elif line.startswith("RCA|"):
             saw_action = True
@@ -776,9 +706,7 @@ def parse_rendered_support(observation_text: str) -> CandidateSupport:
         if len(fields) != 3 or fields[1] != str(index):
             raise CandidateContractError("RCA rows must be contiguous and ordered")
         try:
-            action = canonical_action(
-                parse_strict_json(fields[2], label=f"RCA row {index}")
-            )
+            action = canonical_action(parse_strict_json(fields[2], label=f"RCA row {index}"))
         except CandidateContractError as exc:
             raise CandidateContractError(f"RCA row {index} is invalid") from exc
         if fields[2] != canonical_json(action):

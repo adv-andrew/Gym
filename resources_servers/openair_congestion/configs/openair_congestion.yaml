@@ -49,14 +49,16 @@ openair_congestion:
       # than the generic eight-tool server.  It must use synthetic replay,
       # tier=T2 task rows, and exposes only noop plus server-rendered UE PRB
       # cap candidates as RCP/RCC/RCA/V10B text.  Do not report this mode as
-      # a full-tool policy result.  V10 fixes replay/reward candidate capacity
-      # to 60.0 Mbps per cell (RCC=60000); there is intentionally no separate
+      # a full-tool policy result. V10 requires the exact same-trainer-worktree
+      # congestion_gen sampler and fixes replay/reward candidate capacity to
+      # 250.0 Mbps per cell (RCC=250000); there is intentionally no separate
       # candidate-capacity knob to drift from the causal reward source.
       # It also requires one worker, a fresh launch-injected session secret,
       # and the pre-sealed prompt/task-manifest digests.  These are evidence
       # bindings, not model inputs; never substitute a development default.
       # (e.g. `OPENAIR_V10_SESSION_SECRET=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')`).
       # protocol_mode: runb2_v10_t2_prb_v1
+      # replay_scenario_source: trainer_worktree_congestion_gen_sampler_v1
       # v10_max_steps: 16
       # num_workers: 1
       # v10_session_secret: ${oc.env:OPENAIR_V10_SESSION_SECRET}

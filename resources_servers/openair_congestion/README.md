@@ -42,7 +42,7 @@ Install the telco env package (editable) into the same venv that runs NeMo-Gym:
 pip install -e /path/to/openair-rl-gym/env/nemo_gym/envs/openair_congestion
 ```
 
-`requirements.txt` lists this editable install; adjust the path to the local checkout. A missing telco-env install fails at server startup with an actionable `ImportError`. Standard replay keeps the historical `replay_scenario_source: auto` behavior: it uses the optional `congestion_gen` sampler when importable and otherwise uses the built-in 60-Mbps fallback. RunB2 V10 instead requires `replay_scenario_source: fixed_60_mbps_fallback_v2`; this path never imports the sampler while building a trajectory. Runtime receipts separately report whether `congestion_gen` is importable and prove it was neither configured nor used, so installing the attested package cannot silently change V10 data.
+`requirements.txt` lists this editable install; adjust the path to the local checkout. A missing telco-env install fails at server startup with an actionable `ImportError`. Standard replay keeps the historical `replay_scenario_source: auto` behavior: it uses the optional `congestion_gen` sampler when importable and otherwise uses the built-in 60-Mbps fallback. RunB2 V10 instead requires `replay_scenario_source: trainer_worktree_congestion_gen_sampler_v1`: it imports the generator only from the same trainer worktree as the telco environment, fixes capacity at the generator's 250 Mbps per cell, and fails launch if any required generator source is absent, symlinked, shadowed, or hash-inconsistent. Runtime receipts record all five generator source hashes and attest that the exact source was importable, configured, and used.
 
 ## Dataset Formats
 

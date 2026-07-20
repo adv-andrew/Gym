@@ -151,9 +151,21 @@ _V10_TASK_METADATA = {
     "tier": "T2",
     "max_steps": 4,
 }
+_V10_ACTION_TASK_METADATA = {
+    **_V10_TASK_METADATA,
+    "difficulty": 0.8,
+}
 _V10_TEST_SESSION_SECRET = "test-only-v10-session-secret-2v0yQdG2w8Tn0Hkx6cA7"
 _V10_TEST_SYSTEM_PROMPT_SHA256 = "1" * 64
 _V10_TEST_TASK_MANIFEST_SHA256 = "2" * 64
+_V10_SCENARIO_SOURCE = "trainer_worktree_congestion_gen_sampler_v1"
+_V10_CONGESTION_GEN_SOURCE_PATHS = {
+    "congestion_gen.package": "services/congestion-gen/congestion_gen/__init__.py",
+    "congestion_gen.materializer": ("services/congestion-gen/congestion_gen/materializer.py"),
+    "congestion_gen.sampler": "services/congestion-gen/congestion_gen/sampler.py",
+    "congestion_gen.schemas": "services/congestion-gen/congestion_gen/schemas.py",
+    "congestion_gen.validate": "services/congestion-gen/congestion_gen/validate.py",
+}
 
 
 class TestReset:
@@ -310,7 +322,8 @@ class TestV10ConstrainedProtocol:
     def _env() -> OpenAirCongestionEnv:
         return _make_env(
             protocol_mode=candidate_contract.RUNB2_V10_PROTOCOL_MODE,
-            replay_scenario_source="fixed_60_mbps_fallback_v2",
+            replay_scenario_source=_V10_SCENARIO_SOURCE,
+            cell_capacity_mbps=250.0,
             v10_session_secret=_V10_TEST_SESSION_SECRET,
             v10_system_prompt_sha256=_V10_TEST_SYSTEM_PROMPT_SHA256,
             v10_task_manifest_sha256=_V10_TEST_TASK_MANIFEST_SHA256,
@@ -323,6 +336,7 @@ class TestV10ConstrainedProtocol:
         parsed = candidate_contract.parse_rendered_support(observation)
         assert parsed.support_sha256 == info["candidate_support_sha256"]
         assert parsed.actions == tuple(info["candidate_actions"])
+        assert parsed.policy_text.splitlines()[1] == "P|250.000|0|1"
         assert info["visible_action_support_sha256"] == parsed.support_sha256
         assert info["environment_contract"] == {
             "schema_version": candidate_contract.RUNB2_V10_ACTION_EFFECT_CONTRACT_SCHEMA,
@@ -377,7 +391,7 @@ class TestV10ConstrainedProtocol:
         )
         assert binding["binding_payload"]["capacity_contract"] == {
             "unit": "milli_mbps",
-            "candidate_cell_capacity_mbps": 60.0,
+            "candidate_cell_capacity_mbps": 250.0,
         }
         assert binding["binding_payload"]["runtime_manifest"] == {
             "schema_version": candidate_contract.RUNB2_V10_RUNTIME_MANIFEST_SCHEMA,
@@ -392,7 +406,21 @@ class TestV10ConstrainedProtocol:
         assert info["server_runtime_manifest_sha256"] == candidate_contract.canonical_json_sha256(
             info["server_runtime_manifest"]
         )
-        assert "openair_congestion.t2_candidate_sampler" in info["server_runtime_manifest"]["source_files"]
+        runtime_manifest = info["server_runtime_manifest"]
+        runtime_source_files = runtime_manifest["source_files"]
+        assert "openair_congestion.t2_candidate_sampler" in runtime_source_files
+        public_config = runtime_manifest["effective_public_config"]
+        assert public_config["scenario_source"] == _V10_SCENARIO_SOURCE
+        assert public_config["replay_scenario_source"] == _V10_SCENARIO_SOURCE
+        assert public_config["cell_capacity_mbps"] == 250.0
+        assert public_config["dynamic_congestion_gen_importable"] is True
+        assert public_config["dynamic_congestion_gen_configured"] is True
+        assert public_config["dynamic_congestion_gen_used"] is True
+        assert set(public_config["congestion_gen_source_files"]) == set(_V10_CONGESTION_GEN_SOURCE_PATHS)
+        for source_id, relative_path in _V10_CONGESTION_GEN_SOURCE_PATHS.items():
+            source_record = public_config["congestion_gen_source_files"][source_id]
+            assert source_record["relative_path"] == relative_path
+            assert source_record["sha256"] == runtime_source_files[source_id]
         assert _V10_TEST_SESSION_SECRET not in candidate_contract.canonical_json(info["server_runtime_manifest"])
         task_receipt = info["task_budget_receipt"]
         assert task_receipt["schema_version"] == "openair_runb2_v10_task_budget_receipt_v1"
@@ -418,7 +446,7 @@ class TestV10ConstrainedProtocol:
         )
         assert info["reset_receipt_sha256"] == candidate_contract.canonical_json_sha256(reset_receipt)
         assert binding["binding_payload"]["candidate_capacity_milli_mbps_by_cell"] == [
-            {"cell_id": row["cell_id"], "capacity_milli_mbps": 60_000}
+            {"cell_id": row["cell_id"], "capacity_milli_mbps": 250_000}
             for row in binding["binding_payload"]["candidate_capacity_milli_mbps_by_cell"]
         ]
         assert parsed.visible_binding_sha256 == candidate_contract.canonical_json_sha256(binding["binding_payload"])
@@ -547,10 +575,10 @@ class TestV10ConstrainedProtocol:
         assert (
             transition["pre_capacity_milli_mbps_total"]
             == transition["post_capacity_milli_mbps_total"]
-            == 60_000 * transition["post_cell_count"]
+            == 250_000 * transition["post_cell_count"]
         )
         assert info["reward_measurements"]["cell_capacity_mbps_total"] == pytest.approx(
-            60.0 * transition["post_cell_count"]
+            250.0 * transition["post_cell_count"]
         )
 
     @pytest.mark.asyncio
@@ -618,8 +646,14 @@ class TestV10ConstrainedProtocol:
         # because its L-row also echoes the chosen action.
         acting = self._env()
         baseline = self._env()
-        _, acting_info = await acting.reset(dict(_V10_TASK_METADATA), session_id="acting")
-        await baseline.reset(dict(_V10_TASK_METADATA), session_id="baseline")
+        _, acting_info = await acting.reset(
+            dict(_V10_ACTION_TASK_METADATA),
+            session_id="acting",
+        )
+        await baseline.reset(
+            dict(_V10_ACTION_TASK_METADATA),
+            session_id="baseline",
+        )
         action = next(
             item
             for item in acting_info["candidate_actions"]
@@ -638,7 +672,10 @@ class TestV10ConstrainedProtocol:
     @pytest.mark.asyncio
     async def test_v10_reset_metadata_is_a_deep_copy_not_authoritative_state(self):
         env = self._env()
-        _, info = await env.reset(dict(_V10_TASK_METADATA), session_id="sid")
+        _, info = await env.reset(
+            dict(_V10_ACTION_TASK_METADATA),
+            session_id="sid",
+        )
         index = next(i for i, action in enumerate(info["candidate_actions"]) if action["name"] == "set_prb_cap")
         original = dict(env.session_state["sid"]["candidate_support"].actions[index]["arguments"])
         info["candidate_actions"][index]["arguments"]["max_prb"] = 1
@@ -716,7 +753,8 @@ class TestV10ConstrainedProtocol:
         with pytest.raises(RuntimeError, match="requires backend='replay'"):
             _make_env(
                 protocol_mode=candidate_contract.RUNB2_V10_PROTOCOL_MODE,
-                replay_scenario_source="fixed_60_mbps_fallback_v2",
+                replay_scenario_source=_V10_SCENARIO_SOURCE,
+                cell_capacity_mbps=250.0,
                 v10_session_secret=_V10_TEST_SESSION_SECRET,
                 v10_system_prompt_sha256=_V10_TEST_SYSTEM_PROMPT_SHA256,
                 v10_task_manifest_sha256=_V10_TEST_TASK_MANIFEST_SHA256,
@@ -736,8 +774,8 @@ class TestV10ConstrainedProtocol:
             ({"host": "0.0.0.0"}, "requires an in-process test host or a loopback host"),
             ({"entrypoint": "serve.py"}, "requires the bound app.py entrypoint"),
             ({"replay_scenario_source": "auto"}, "'auto' is forbidden"),
-            ({"cell_capacity_mbps": 59.0}, "fixes cell_capacity_mbps at 60.0"),
-            ({"candidate_cell_capacity_mbps": 60.0}, "was removed for V10"),
+            ({"cell_capacity_mbps": 60.0}, "fixes cell_capacity_mbps at 250.0"),
+            ({"candidate_cell_capacity_mbps": 250.0}, "was removed for V10"),
             ({"v10_max_steps": 17}, "v10_max_steps must be a positive integer"),
             ({"v10_max_steps": 5, "agent_max_steps": 4}, "v10_max_steps must be"),
         ),
@@ -745,7 +783,8 @@ class TestV10ConstrainedProtocol:
     def test_v10_refuses_unsafe_launch_configuration(self, overrides, error):
         config = {
             "protocol_mode": candidate_contract.RUNB2_V10_PROTOCOL_MODE,
-            "replay_scenario_source": "fixed_60_mbps_fallback_v2",
+            "replay_scenario_source": _V10_SCENARIO_SOURCE,
+            "cell_capacity_mbps": 250.0,
             "v10_session_secret": _V10_TEST_SESSION_SECRET,
             "v10_system_prompt_sha256": _V10_TEST_SYSTEM_PROMPT_SHA256,
             "v10_task_manifest_sha256": _V10_TEST_TASK_MANIFEST_SHA256,
@@ -759,17 +798,13 @@ class TestV10ConstrainedProtocol:
         with pytest.raises(RuntimeError, match="OPENAIR_CONGESTION_BACKEND"):
             self._env()
 
-    def test_v10_attests_importable_generator_but_keeps_it_disabled(self, monkeypatch):
-        monkeypatch.setattr(
-            "resources_servers.openair_congestion.app.importlib.util.find_spec",
-            lambda _name: object(),
-        )
+    def test_v10_attests_exact_generator_as_configured_and_used(self):
         env = self._env()
         config = env._v10_runtime_manifest["effective_public_config"]
         assert config["dynamic_congestion_gen_importable"] is True
-        assert config["dynamic_congestion_gen_configured"] is False
-        assert config["dynamic_congestion_gen_used"] is False
-        assert config["scenario_source"] == "fixed_60_mbps_fallback_v2"
+        assert config["dynamic_congestion_gen_configured"] is True
+        assert config["dynamic_congestion_gen_used"] is True
+        assert config["scenario_source"] == _V10_SCENARIO_SOURCE
 
     @pytest.mark.asyncio
     async def test_v10_requires_explicit_bounded_task_max_steps(self):
@@ -991,7 +1026,8 @@ class TestHTTPSurface:
     async def test_v10_http_cookie_contract_binds_the_pre_step_support(self):
         env = _make_env(
             protocol_mode=candidate_contract.RUNB2_V10_PROTOCOL_MODE,
-            replay_scenario_source="fixed_60_mbps_fallback_v2",
+            replay_scenario_source=_V10_SCENARIO_SOURCE,
+            cell_capacity_mbps=250.0,
             v10_session_secret=_V10_TEST_SESSION_SECRET,
             v10_system_prompt_sha256=_V10_TEST_SYSTEM_PROMPT_SHA256,
             v10_task_manifest_sha256=_V10_TEST_TASK_MANIFEST_SHA256,
@@ -1027,14 +1063,14 @@ class TestBackends:
         assert isinstance(backend, ReplayBackend)
         assert not isinstance(backend, V10FixedReplayBackend)
 
-    def test_select_backend_uses_fixed_replay_only_when_explicit(self, monkeypatch):
+    def test_select_backend_uses_v10_generator_replay_only_when_explicit(self, monkeypatch):
         monkeypatch.delenv("OPENAIR_CONGESTION_BACKEND", raising=False)
         config = OpenAirCongestionResourcesServerConfig(
             host="",
             port=0,
             entrypoint="",
             name="",
-            replay_scenario_source="fixed_60_mbps_fallback_v2",
+            replay_scenario_source=_V10_SCENARIO_SOURCE,
         )
         assert isinstance(select_backend(config), V10FixedReplayBackend)
 

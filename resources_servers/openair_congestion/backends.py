@@ -73,7 +73,7 @@ from openair_congestion.replay_env import ReplayEnv  # noqa: E402
 from openair_congestion.schemas import EpisodeMeta, Observation, ToolCall  # noqa: E402
 from openair_congestion.v10_fixed_replay import (  # noqa: E402
     V10_FIXED_REPLAY_SCENARIO_SOURCE,
-    V10FixedReplayEnv,
+    V10CongestionGenReplayEnv,
 )
 
 
@@ -204,7 +204,7 @@ class ReplayBackend(Backend):
 
 
 class V10FixedReplayBackend(ReplayBackend):
-    """Replay driver whose scenario builder cannot import ``congestion_gen``."""
+    """Replay driver requiring the exact same-worktree ``congestion_gen``."""
 
     def __init__(
         self,
@@ -213,7 +213,7 @@ class V10FixedReplayBackend(ReplayBackend):
         pool_size: int = 32,
         max_steps_default: int = 60,
     ) -> None:
-        self._env = V10FixedReplayEnv(
+        self._env = V10CongestionGenReplayEnv(
             replay_root=replay_root,
             pool_size=pool_size,
             max_steps_default=max_steps_default,

@@ -36,7 +36,6 @@ from __future__ import annotations
 import hashlib
 import importlib
 import importlib.metadata
-import importlib.util
 import json
 import math
 import os
@@ -98,7 +97,7 @@ class OpenAirCongestionResourcesServerConfig(BaseResourcesServerConfig):
     pool_size: int = 32
     max_steps_default: int = 60
     # ``auto`` preserves the standard server's historical optional-generator
-    # behavior.  V10 rejects it and requires the exact fixed fallback source.
+    # behavior. V10 rejects it and requires the exact trainer-worktree sampler.
     replay_scenario_source: str = "auto"
     # dataset_replay knobs: replay a recorded dataset (KPI snapshots or GRPO
     # rollout traces; see dataset_backend.py) instead of synthesizing
@@ -152,8 +151,15 @@ _V10_SESSION_SECRET_MIN_CHARS = 43  # len(secrets.token_urlsafe(32))
 _V10_TASK_BUDGET_RECEIPT_SCHEMA = "openair_runb2_v10_task_budget_receipt_v1"
 _V10_RESET_RECEIPT_SCHEMA = "openair_runb2_v10_reset_receipt_v1"
 _V10_TRANSITION_BINDING_SCHEMA = "openair_runb2_v10_transition_binding_v2"
-_V10_RUNTIME_MANIFEST_SOURCE_SCHEMA = "openair_runb2_v10_runtime_manifest_v1"
+_V10_RUNTIME_MANIFEST_SOURCE_SCHEMA = "openair_runb2_v10_runtime_manifest_v2"
 _V10_REPLAY_SCENARIO_SOURCE = V10_FIXED_REPLAY_SCENARIO_SOURCE
+_V10_CONGESTION_GEN_SOURCE_RELATIVE_PATHS = {
+    "congestion_gen.package": "services/congestion-gen/congestion_gen/__init__.py",
+    "congestion_gen.materializer": ("services/congestion-gen/congestion_gen/materializer.py"),
+    "congestion_gen.sampler": "services/congestion-gen/congestion_gen/sampler.py",
+    "congestion_gen.schemas": "services/congestion-gen/congestion_gen/schemas.py",
+    "congestion_gen.validate": "services/congestion-gen/congestion_gen/validate.py",
+}
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _V10_REWARD_TERM_KEYS = frozenset(
     {
@@ -292,7 +298,7 @@ class OpenAirCongestionEnv(GymnasiumServer):
             if not isinstance(self._backend, V10FixedReplayBackend):
                 raise V10ProtocolError(
                     "V10 constrained protocol requires backend='replay' with the "
-                    "fixed replay source, never standard replay, dataset_replay, "
+                    "same-worktree congestion_gen source, never standard replay, dataset_replay, "
                     "or a live collector"
                 )
             self._freeze_v10_runtime_manifest()
@@ -353,8 +359,8 @@ class OpenAirCongestionEnv(GymnasiumServer):
             )
         # `cell_capacity_mbps` is a dataset-replay option that ReplayBackend
         # does not consume.  Refuse a conflicting value in V10 rather than
-        # leave an apparent capacity knob that disagrees with the fixed 60
-        # Mbps replay reward/action-effect source.
+        # leave an apparent capacity knob that disagrees with the generator's
+        # 250-Mbps replay reward/action-effect source.
         capacity = self.config.cell_capacity_mbps
         if (
             not isinstance(capacity, (int, float))
@@ -363,11 +369,11 @@ class OpenAirCongestionEnv(GymnasiumServer):
             or float(capacity) != candidate_contract.RUNB2_V10_CELL_CAPACITY_MBPS
         ):
             raise V10ProtocolError(
-                "V10 fixes cell_capacity_mbps at 60.0 to match replay reward and candidate-capacity provenance"
+                "V10 fixes cell_capacity_mbps at 250.0 to match congestion_gen reward and candidate-capacity provenance"
             )
         if self.config.candidate_cell_capacity_mbps is not None:
             raise V10ProtocolError(
-                "candidate_cell_capacity_mbps was removed for V10; replay capacity is pinned to 60.0 Mbps per cell"
+                "candidate_cell_capacity_mbps was removed for V10; replay capacity is pinned to 250.0 Mbps per cell"
             )
         secret = self.config.v10_session_secret
         # A cryptographic property cannot be inferred from a string, but an
@@ -390,16 +396,9 @@ class OpenAirCongestionEnv(GymnasiumServer):
                 raise V10ProtocolError(f"V10 requires a pinned lowercase SHA-256 {field_name}")
 
         reward_capacity_override = os.environ.get("ENV_REWARD_CELL_CAPACITY_MBPS")
-        if reward_capacity_override is not None and reward_capacity_override.strip():
-            try:
-                parsed_reward_capacity = float(reward_capacity_override)
-            except ValueError as exc:
-                raise V10ProtocolError("V10 ENV_REWARD_CELL_CAPACITY_MBPS must be unset or exactly 60.0") from exc
-            if (
-                not math.isfinite(parsed_reward_capacity)
-                or parsed_reward_capacity != candidate_contract.RUNB2_V10_CELL_CAPACITY_MBPS
-            ):
-                raise V10ProtocolError("V10 ENV_REWARD_CELL_CAPACITY_MBPS must be unset or exactly 60.0")
+        if reward_capacity_override is not None and reward_capacity_override != "":
+            if reward_capacity_override != "250.0":
+                raise V10ProtocolError("V10 ENV_REWARD_CELL_CAPACITY_MBPS must be unset or exactly 250.0")
 
     def setup_session_middleware(self, app: FastAPI) -> None:
         """Use a launch-injected signing secret for V10 without leaking it as a cookie name."""
@@ -465,13 +464,31 @@ class OpenAirCongestionEnv(GymnasiumServer):
         if not isinstance(self._backend, V10FixedReplayBackend):
             raise V10ProtocolError("V10 scenario-source evidence requires V10FixedReplayBackend")
         source_evidence = self._backend.scenario_source_evidence()
-        expected_source_evidence = {
-            "scenario_source": _V10_REPLAY_SCENARIO_SOURCE,
-            "dynamic_congestion_gen_configured": False,
-            "dynamic_congestion_gen_used": False,
-        }
-        if source_evidence != expected_source_evidence:
-            raise V10ProtocolError("V10 replay source evidence permits or used dynamic congestion_gen")
+        if not isinstance(source_evidence, dict) or (
+            source_evidence.get("scenario_source") != _V10_REPLAY_SCENARIO_SOURCE
+            or source_evidence.get("cell_capacity_mbps") != candidate_contract.RUNB2_V10_CELL_CAPACITY_MBPS
+            or source_evidence.get("dynamic_congestion_gen_importable") is not True
+            or source_evidence.get("dynamic_congestion_gen_configured") is not True
+            or source_evidence.get("dynamic_congestion_gen_used") is not True
+        ):
+            raise V10ProtocolError("V10 replay source did not attest exact trainer-worktree congestion_gen use")
+        evidence_files = source_evidence.get("congestion_gen_source_files")
+        if not isinstance(evidence_files, dict) or set(evidence_files) != set(
+            _V10_CONGESTION_GEN_SOURCE_RELATIVE_PATHS
+        ):
+            raise V10ProtocolError("V10 congestion_gen source evidence is incomplete")
+        normalized_source_files: dict[str, dict[str, str]] = {}
+        for source_id, relative_path in sorted(_V10_CONGESTION_GEN_SOURCE_RELATIVE_PATHS.items()):
+            record = evidence_files.get(source_id)
+            if (
+                not isinstance(record, dict)
+                or set(record) != {"relative_path", "sha256"}
+                or record.get("relative_path") != relative_path
+                or not isinstance(record.get("sha256"), str)
+                or _SHA256_RE.fullmatch(record["sha256"]) is None
+            ):
+                raise V10ProtocolError(f"V10 congestion_gen source evidence drifted for {source_id}")
+            normalized_source_files[source_id] = dict(record)
         return {
             "backend": self.config.backend,
             "replay_root": self.config.replay_root,
@@ -485,21 +502,13 @@ class OpenAirCongestionEnv(GymnasiumServer):
             "num_workers": 1 if self.config.num_workers is None else self.config.num_workers,
             "reward_profile": candidate_contract.RUNB2_V10_REWARD_PROFILE,
             "reward_weights": asdict(DEFAULT_WEIGHTS),
-            **source_evidence,
-            "dynamic_congestion_gen_importable": (self._dynamic_congestion_gen_importable()),
+            "scenario_source": _V10_REPLAY_SCENARIO_SOURCE,
+            "dynamic_congestion_gen_importable": True,
+            "dynamic_congestion_gen_configured": True,
+            "dynamic_congestion_gen_used": True,
+            "congestion_gen_source_files": normalized_source_files,
             "env_reward_cell_capacity_mbps": (os.environ.get("ENV_REWARD_CELL_CAPACITY_MBPS") or "unset"),
         }
-
-    @staticmethod
-    def _dynamic_congestion_gen_importable() -> bool:
-        """Attest package visibility without making it a V10 behavior source."""
-
-        try:
-            return importlib.util.find_spec("congestion_gen.sampler") is not None
-        except (ImportError, ModuleNotFoundError):
-            return False
-        except (AttributeError, ValueError) as exc:
-            raise V10ProtocolError("cannot attest whether congestion_gen.sampler is importable") from exc
 
     @staticmethod
     def _dependency_version(distribution: str) -> str:
@@ -515,9 +524,8 @@ class OpenAirCongestionEnv(GymnasiumServer):
         accidental snapshot of ``sys.modules``.  Every local module listed
         here participates directly in request/session handling, finite support
         construction, replay transitions, reward calculation, or KPI/render
-        semantics.  V10 may attest an installed ``congestion_gen`` package,
-        but the explicit fixed source never imports it while building replay
-        trajectories, so it is not part of this behavior closure.
+        semantics. V10 executes ``congestion_gen`` from the same trainer
+        worktree, so its complete package-import closure is mandatory here.
         """
 
         return {
@@ -546,17 +554,26 @@ class OpenAirCongestionEnv(GymnasiumServer):
             "openair_congestion.t2_policy_features": t2_policy_features_source,
             "openair_congestion.tools": tools_source,
             "openair_congestion.v10_fixed_replay": v10_fixed_replay_source,
+            "congestion_gen.package": importlib.import_module("congestion_gen"),
+            "congestion_gen.materializer": importlib.import_module("congestion_gen.materializer"),
+            "congestion_gen.sampler": importlib.import_module("congestion_gen.sampler"),
+            "congestion_gen.schemas": importlib.import_module("congestion_gen.schemas"),
+            "congestion_gen.validate": importlib.import_module("congestion_gen.validate"),
         }
 
     def _v10_runtime_manifest_payload(self) -> dict[str, Any]:
         """Build the frozen, secret-free V10 runtime identity payload."""
 
+        public_config = self._v10_public_config()
         source_files: dict[str, str] = {}
         for logical_name, module in sorted(self._v10_runtime_source_modules().items()):
             source_path = getattr(module, "__file__", None)
             if not isinstance(source_path, str) or not source_path:
                 raise V10ProtocolError(f"V10 runtime source path is unavailable for {logical_name}")
             source_files[logical_name] = self._sha256_source_file(source_path, label=logical_name)
+        for source_id, record in public_config["congestion_gen_source_files"].items():
+            if source_files.get(source_id) != record["sha256"]:
+                raise V10ProtocolError(f"V10 congestion_gen evidence/source closure mismatch at {source_id}")
         app_sha = source_files["resource_server.app"]
         return {
             "schema_version": _V10_RUNTIME_MANIFEST_SOURCE_SCHEMA,
@@ -564,7 +581,7 @@ class OpenAirCongestionEnv(GymnasiumServer):
                 "logical_path": "resources_servers/openair_congestion/app.py",
                 "sha256": app_sha,
             },
-            "effective_public_config": self._v10_public_config(),
+            "effective_public_config": public_config,
             "source_files": source_files,
             "dependency_versions": {
                 "python": platform.python_version(),
@@ -588,8 +605,9 @@ class OpenAirCongestionEnv(GymnasiumServer):
                 "single_worker": True,
                 "loopback_or_inprocess_only": True,
                 "scenario_source": _V10_REPLAY_SCENARIO_SOURCE,
-                "dynamic_congestion_gen_configured": False,
-                "dynamic_congestion_gen_used": False,
+                "dynamic_congestion_gen_importable": True,
+                "dynamic_congestion_gen_configured": True,
+                "dynamic_congestion_gen_used": True,
             },
         }
 
