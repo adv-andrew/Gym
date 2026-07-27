@@ -40,10 +40,12 @@ openair = pytest.importorskip(
     reason="telco env package 'openair_congestion' not installed; see README Setup",
 )
 
+from resources_servers.openair_congestion import app as app_source  # noqa: E402
 from resources_servers.openair_congestion import candidate_contract  # noqa: E402
 from resources_servers.openair_congestion.app import (  # noqa: E402
     OpenAirCongestionEnv,
     OpenAirCongestionResourcesServerConfig,
+    V10ProtocolError,
 )
 from resources_servers.openair_congestion.backends import (  # noqa: E402
     OAICollectorBackend,
@@ -166,6 +168,32 @@ _V10_CONGESTION_GEN_SOURCE_PATHS = {
     "congestion_gen.schemas": "services/congestion-gen/congestion_gen/schemas.py",
     "congestion_gen.validate": "services/congestion-gen/congestion_gen/validate.py",
 }
+_V10_EXPECTED_REWARD_WEIGHTS = {
+    "w_sla": 1.0,
+    "w_tput": 2.0,
+    "w_fair": 5.0,
+    "w_buffer": 0.15,
+    "w_sla_level": 0.8,
+    "w_prb_level": 0.4,
+    "w_access_level": 0.3,
+    "w_fair_level": 0.35,
+    "w_action": 0.0,
+    "w_reject": 0.5,
+}
+_ZERO_FORCED_V10_SERVICE_ACCOUNTING = {
+    "requested_service_mbps": 10.0,
+    "admitted_service_mbps": 8.0,
+    "delivered_service_mbps": 6.0,
+    "forced_terminated_service_mbps": 0.0,
+    "cumulative_forced_terminated_service_mbps": 0.0,
+    "forced_termination_events": 0.0,
+    "step_forced_terminated_service_mbps": 0.0,
+    "step_forced_termination_events": 0.0,
+    "unadmitted_service_mbps": 2.0,
+    "undelivered_admitted_service_mbps": 2.0,
+}
+_VALID_V10_SERVICE_ACCOUNTING = dict(_ZERO_FORCED_V10_SERVICE_ACCOUNTING)
+_PREVIOUS_V10_SERVICE_ACCOUNTING = dict(_ZERO_FORCED_V10_SERVICE_ACCOUNTING)
 
 
 class TestReset:
@@ -318,6 +346,10 @@ class TestStep:
 class TestV10ConstrainedProtocol:
     """The V10 path is deliberately narrower than the generic resource server."""
 
+    def test_public_contract_exports_both_exact_reward_vectors(self):
+        assert "runb2_v10_reward_coefficients" in candidate_contract.__all__
+        assert "runb2_v10_reward_weights" in candidate_contract.__all__
+
     @staticmethod
     def _env() -> OpenAirCongestionEnv:
         return _make_env(
@@ -346,18 +378,9 @@ class TestV10ConstrainedProtocol:
             "candidate_contract": candidate_contract.RESOURCE_CANDIDATE_CONTRACT,
         }
         assert info["action_scope"] == candidate_contract.RUNB2_V10_ACTION_SCOPE
-        assert set(info["reward_weights"]) == {
-            "w_sla",
-            "w_tput",
-            "w_fair",
-            "w_buffer",
-            "w_sla_level",
-            "w_prb_level",
-            "w_access_level",
-            "w_fair_level",
-            "w_action",
-            "w_reject",
-        }
+        assert info["reward_profile"] == "openair_t2_v3"
+        assert info["reward_version"] == "openair_t2_v3"
+        assert info["reward_weights"] == _V10_EXPECTED_REWARD_WEIGHTS
         assert info["tier"] == "T2"
         assert parsed.visible_binding_schema == (candidate_contract.RUNB2_V10_VISIBLE_BINDING_SCHEMA)
         assert parsed.visible_binding_sha256 is not None
@@ -393,6 +416,20 @@ class TestV10ConstrainedProtocol:
             "unit": "milli_mbps",
             "candidate_cell_capacity_mbps": 250.0,
         }
+        assert binding["binding_payload"]["reward_contract"] == {
+            "reward_profile": "openair_t2_v3",
+            "reward_version": "openair_t2_v3",
+            "reward_weights": info["reward_weights"],
+            "reward_coefficients": {
+                "service_denial": 1.0,
+                "delivery_gap": 1.25,
+                "elastic_fairness": 0.25,
+                "sla": 2.0,
+                "forced_event": 5.0,
+                "forced_ratio": 2.0,
+                "action": 0.005,
+            },
+        }
         assert binding["binding_payload"]["runtime_manifest"] == {
             "schema_version": candidate_contract.RUNB2_V10_RUNTIME_MANIFEST_SCHEMA,
             "sha256": info["server_runtime_manifest_sha256"],
@@ -413,6 +450,17 @@ class TestV10ConstrainedProtocol:
         assert public_config["scenario_source"] == _V10_SCENARIO_SOURCE
         assert public_config["replay_scenario_source"] == _V10_SCENARIO_SOURCE
         assert public_config["cell_capacity_mbps"] == 250.0
+        assert public_config["reward_profile"] == "openair_t2_v3"
+        assert public_config["reward_version"] == "openair_t2_v3"
+        assert public_config["reward_coefficients"] == {
+            "service_denial": 1.0,
+            "delivery_gap": 1.25,
+            "elastic_fairness": 0.25,
+            "sla": 2.0,
+            "forced_event": 5.0,
+            "forced_ratio": 2.0,
+            "action": 0.005,
+        }
         assert public_config["dynamic_congestion_gen_importable"] is True
         assert public_config["dynamic_congestion_gen_configured"] is True
         assert public_config["dynamic_congestion_gen_used"] is True
@@ -460,6 +508,27 @@ class TestV10ConstrainedProtocol:
             candidate_contract.parse_rendered_support(tampered)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("weight_name", tuple(_V10_EXPECTED_REWARD_WEIGHTS))
+    async def test_v10_visible_binding_rejects_any_reward_weight_numeric_drift(
+        self,
+        weight_name,
+    ):
+        env = self._env()
+        observation, info = await env.reset(dict(_V10_TASK_METADATA), session_id="sid")
+        support = candidate_contract.parse_rendered_support(observation.rsplit("\n", 1)[0])
+        payload = json.loads(candidate_contract.canonical_json(info["server_observation_binding"]["binding_payload"]))
+        payload["reward_contract"]["reward_weights"][weight_name] += 0.125
+
+        with pytest.raises(
+            candidate_contract.CandidateContractError,
+            match=rf"reward weight {weight_name} is wrong",
+        ):
+            candidate_contract.validate_visible_binding_payload(
+                payload,
+                support=support,
+            )
+
+    @pytest.mark.asyncio
     async def test_supported_call_has_pre_step_attestation_and_complete_reward_arithmetic(self):
         env = self._env()
         observation, reset_info = await env.reset(dict(_V10_TASK_METADATA), session_id="sid")
@@ -478,6 +547,40 @@ class TestV10ConstrainedProtocol:
         assert info["reward_terms"]["total"] == pytest.approx(reward)
         assert sum(value for key, value in info["reward_terms"].items() if key != "total") == pytest.approx(reward)
         assert all(math.isfinite(value) for value in info["reward_measurements"].values())
+        assert info["reward_profile"] == "openair_t2_v3"
+        assert info["reward_version"] == "openair_t2_v3"
+        assert set(info["service_accounting"]) == {
+            "requested_service_mbps",
+            "admitted_service_mbps",
+            "delivered_service_mbps",
+            "forced_terminated_service_mbps",
+            "cumulative_forced_terminated_service_mbps",
+            "forced_termination_events",
+            "step_forced_terminated_service_mbps",
+            "step_forced_termination_events",
+            "unadmitted_service_mbps",
+            "undelivered_admitted_service_mbps",
+        }
+        assert all(value >= 0.0 and math.isfinite(value) for value in info["service_accounting"].values())
+        ledger = info["service_accounting"]
+        assert ledger["requested_service_mbps"] >= ledger["admitted_service_mbps"]
+        assert ledger["admitted_service_mbps"] >= ledger["delivered_service_mbps"]
+        assert ledger["unadmitted_service_mbps"] == pytest.approx(
+            ledger["requested_service_mbps"] - ledger["admitted_service_mbps"]
+        )
+        assert ledger["undelivered_admitted_service_mbps"] == pytest.approx(
+            ledger["admitted_service_mbps"] - ledger["delivered_service_mbps"]
+        )
+        assert ledger["step_forced_terminated_service_mbps"] == pytest.approx(
+            ledger["cumulative_forced_terminated_service_mbps"]
+        )
+        assert ledger["step_forced_termination_events"] == pytest.approx(ledger["forced_termination_events"])
+        assert env.session_state["sid"]["service_accounting"] == ledger
+        for key, value in info["service_accounting"].items():
+            assert info["reward_measurements"][key] == pytest.approx(value)
+        assert info["service_accounting_sha256"] == candidate_contract.canonical_json_sha256(
+            info["service_accounting"]
+        )
         assert info["training_eligible"] is True
         assert info["rollout_usable"] is True
         assert info["training_usable"] is True
@@ -500,7 +603,11 @@ class TestV10ConstrainedProtocol:
             "kpi_source",
             "dynamics_mode",
             "reward_profile",
+            "reward_version",
             "reward_weights",
+            "reward_coefficients",
+            "service_accounting",
+            "service_accounting_sha256",
             "terminated",
             "truncated",
             "training_usable",
@@ -514,6 +621,13 @@ class TestV10ConstrainedProtocol:
         assert receipt["scalar_reward"] == pytest.approx(reward)
         assert receipt["reward_measurements"] == info["reward_measurements"]
         assert receipt["reward_terms"] == info["reward_terms"]
+        assert receipt["reward_profile"] == info["reward_profile"] == "openair_t2_v3"
+        assert receipt["reward_version"] == info["reward_version"] == "openair_t2_v3"
+        assert receipt["reward_coefficients"] == info["reward_coefficients"]
+        assert receipt["service_accounting"] == info["service_accounting"]
+        assert receipt["service_accounting_sha256"] == candidate_contract.canonical_json_sha256(
+            receipt["service_accounting"]
+        )
         assert receipt["reward_measurements_sha256"] == candidate_contract.canonical_json_sha256(
             receipt["reward_measurements"]
         )
@@ -580,6 +694,515 @@ class TestV10ConstrainedProtocol:
         assert info["reward_measurements"]["cell_capacity_mbps_total"] == pytest.approx(
             250.0 * transition["post_cell_count"]
         )
+
+    @pytest.mark.asyncio
+    async def test_v10_server_local_formula_rejects_coupled_shared_reward_corruption(
+        self,
+        monkeypatch,
+    ):
+        """A corrupted producer and shared helper cannot redefine the objective together."""
+
+        env = self._env()
+        observation, _ = await env.reset(dict(_V10_TASK_METADATA), session_id="sid")
+        support = candidate_contract.parse_rendered_support(observation)
+        original_step = env.backend.step
+        coupled_breakdown: dict[str, object] = {}
+
+        def corrupted_step(*args, **kwargs):
+            next_obs, reward, done, step_info = original_step(*args, **kwargs)
+            step_info = dict(step_info)
+            terms = dict(step_info["reward_terms"])
+            terms["service_denial"] += 0.125
+            terms["total"] += 0.125
+            measurements = dict(step_info["reward_measurements"])
+            step_info["reward_terms"] = terms
+            coupled_breakdown.update(
+                {
+                    "measurements": measurements,
+                    "terms": terms,
+                    "total": reward + 0.125,
+                }
+            )
+            return next_obs, reward + 0.125, done, step_info
+
+        def coupled_shared_compute_breakdown(*_args, **_kwargs):
+            return coupled_breakdown
+
+        monkeypatch.setattr(env.backend, "step", corrupted_step)
+        monkeypatch.setattr(
+            app_source,
+            "compute_breakdown",
+            coupled_shared_compute_breakdown,
+        )
+        next_observation, reward, terminated, truncated, info = await env.step(
+            _tool_response(support.actions[0]["name"], support.actions[0]["arguments"]),
+            {},
+            session_id="sid",
+        )
+        assert next_observation is None
+        assert reward == 0.0 and terminated is False and truncated is True
+        assert info["protocol_rejection"] is True
+        assert info["rejection_reason"].startswith("server_contract_failure:")
+        assert info["environment_transition_discarded"] is True
+        assert info["training_usable"] is False
+        assert "sid" not in env.session_state
+
+    @pytest.mark.asyncio
+    async def test_v10_server_local_ledger_rejects_coupled_service_arithmetic_corruption(
+        self,
+        monkeypatch,
+    ):
+        env = self._env()
+        observation, _ = await env.reset(dict(_V10_TASK_METADATA), session_id="sid")
+        support = candidate_contract.parse_rendered_support(observation)
+        original_step = env.backend.step
+        coupled_breakdown: dict[str, object] = {}
+
+        def corrupted_step(*args, **kwargs):
+            next_obs, _reward, done, step_info = original_step(*args, **kwargs)
+            step_info = dict(step_info)
+            ledger = dict(step_info["service_accounting"])
+            ledger["requested_service_mbps"] += 10.0
+            ledger["unadmitted_service_mbps"] += 10.0
+            measurements = dict(step_info["reward_measurements"])
+            measurements.update(ledger)
+            terms = dict(step_info["reward_terms"])
+            terms["service_denial"] = -(ledger["unadmitted_service_mbps"] / ledger["requested_service_mbps"])
+            terms["delivery_gap"] = -1.25 * (
+                ledger["undelivered_admitted_service_mbps"] / ledger["requested_service_mbps"]
+            )
+            terms["total"] = sum(value for key, value in terms.items() if key != "total")
+            step_info["service_accounting"] = ledger
+            step_info["reward_measurements"] = measurements
+            step_info["reward_terms"] = terms
+            coupled_breakdown.update(
+                {
+                    "measurements": measurements,
+                    "terms": terms,
+                    "total": terms["total"],
+                }
+            )
+            return next_obs, terms["total"], done, step_info
+
+        monkeypatch.setattr(env.backend, "step", corrupted_step)
+        monkeypatch.setattr(
+            app_source,
+            "compute_breakdown",
+            lambda *_args, **_kwargs: coupled_breakdown,
+        )
+        next_observation, reward, terminated, truncated, info = await env.step(
+            _tool_response(support.actions[0]["name"], support.actions[0]["arguments"]),
+            {},
+            session_id="sid",
+        )
+        assert next_observation is None
+        assert reward == 0.0 and terminated is False and truncated is True
+        assert info["protocol_rejection"] is True
+        assert info["rejection_reason"].startswith("server_contract_failure:")
+        assert info["environment_transition_discarded"] is True
+        assert info["training_usable"] is False
+        assert "sid" not in env.session_state
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_reward_version", [None, "openair_v1", "openair_t2_v2"])
+    async def test_v10_quarantines_missing_or_wrong_step_reward_version(
+        self,
+        monkeypatch,
+        bad_reward_version,
+    ):
+        env = self._env()
+        observation, _ = await env.reset(dict(_V10_TASK_METADATA), session_id="sid")
+        support = candidate_contract.parse_rendered_support(observation)
+        original_step = env.backend.step
+
+        def corrupted_step(*args, **kwargs):
+            next_obs, reward, done, step_info = original_step(*args, **kwargs)
+            step_info = dict(step_info)
+            if bad_reward_version is None:
+                step_info.pop("reward_version", None)
+            else:
+                step_info["reward_version"] = bad_reward_version
+            return next_obs, reward, done, step_info
+
+        monkeypatch.setattr(env.backend, "step", corrupted_step)
+        next_observation, reward, terminated, truncated, info = await env.step(
+            _tool_response(support.actions[0]["name"], support.actions[0]["arguments"]),
+            {},
+            session_id="sid",
+        )
+        assert next_observation is None
+        assert reward == 0.0 and terminated is False and truncated is True
+        assert info["protocol_rejection"] is True
+        assert info["rejection_reason"].startswith("server_contract_failure:")
+        assert info["environment_transition_discarded"] is True
+        assert info["training_usable"] is False
+        assert "sid" not in env.session_state
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "corrupt_service_accounting",
+        [
+            lambda _mapping: None,
+            lambda mapping: {**mapping, "unexpected": 0.0},
+            lambda mapping: {key: value for key, value in mapping.items() if key != "requested_service_mbps"},
+            lambda mapping: {**mapping, "requested_service_mbps": float("nan")},
+            lambda mapping: {**mapping, "requested_service_mbps": -1.0},
+        ],
+        ids=("missing", "extra-key", "missing-key", "nonfinite", "negative"),
+    )
+    async def test_v10_quarantines_invalid_exact_service_accounting(
+        self,
+        monkeypatch,
+        corrupt_service_accounting,
+    ):
+        env = self._env()
+        observation, _ = await env.reset(dict(_V10_TASK_METADATA), session_id="sid")
+        support = candidate_contract.parse_rendered_support(observation)
+        original_step = env.backend.step
+
+        def corrupted_step(*args, **kwargs):
+            next_obs, reward, done, step_info = original_step(*args, **kwargs)
+            step_info = dict(step_info)
+            step_info["service_accounting"] = corrupt_service_accounting(dict(step_info["service_accounting"]))
+            return next_obs, reward, done, step_info
+
+        monkeypatch.setattr(env.backend, "step", corrupted_step)
+        next_observation, reward, terminated, truncated, info = await env.step(
+            _tool_response(support.actions[0]["name"], support.actions[0]["arguments"]),
+            {},
+            session_id="sid",
+        )
+        assert next_observation is None
+        assert reward == 0.0 and terminated is False and truncated is True
+        assert info["protocol_rejection"] is True
+        assert info["rejection_reason"].startswith("server_contract_failure:")
+        assert info["environment_transition_discarded"] is True
+        assert info["training_usable"] is False
+        assert "sid" not in env.session_state
+
+    @pytest.mark.parametrize(
+        "mutated",
+        [
+            {
+                **_ZERO_FORCED_V10_SERVICE_ACCOUNTING,
+                "forced_terminated_service_mbps": 1.0,
+            },
+            {
+                **_ZERO_FORCED_V10_SERVICE_ACCOUNTING,
+                "cumulative_forced_terminated_service_mbps": 1.0,
+            },
+            {
+                **_ZERO_FORCED_V10_SERVICE_ACCOUNTING,
+                "forced_termination_events": 1.0,
+            },
+            {
+                **_ZERO_FORCED_V10_SERVICE_ACCOUNTING,
+                "step_forced_terminated_service_mbps": 1.0,
+            },
+            {
+                **_ZERO_FORCED_V10_SERVICE_ACCOUNTING,
+                "step_forced_termination_events": 1.0,
+            },
+            {
+                **_ZERO_FORCED_V10_SERVICE_ACCOUNTING,
+                "forced_terminated_service_mbps": 1.0,
+                "cumulative_forced_terminated_service_mbps": 1.0,
+                "forced_termination_events": 1.0,
+                "step_forced_terminated_service_mbps": 1.0,
+                "step_forced_termination_events": 1.0,
+            },
+        ],
+        ids=(
+            "forced-service",
+            "cumulative-forced-service",
+            "forced-events",
+            "step-forced-service",
+            "step-forced-events",
+            "coupled-valid-looking-forced-ledger",
+        ),
+    )
+    def test_v10_prb_only_scope_rejects_every_nonzero_forced_service_field(
+        self,
+        mutated,
+    ):
+        with pytest.raises(
+            V10ProtocolError,
+            match="PRB-only V10 service_accounting forced fields must be exactly zero",
+        ):
+            OpenAirCongestionEnv._validated_v10_service_accounting(
+                dict(mutated),
+                previous=None,
+            )
+
+    @pytest.mark.asyncio
+    async def test_v10_two_step_quarantines_coupled_corruption_against_carried_ledger(
+        self,
+        monkeypatch,
+    ):
+        env = self._env()
+        observation, _ = await env.reset(dict(_V10_TASK_METADATA), session_id="sid")
+        support = candidate_contract.parse_rendered_support(observation)
+        first_observation, _, terminated, truncated, _ = await env.step(
+            _tool_response(support.actions[0]["name"], support.actions[0]["arguments"]),
+            {},
+            session_id="sid",
+        )
+        assert first_observation is not None
+        assert not terminated and not truncated
+        first_ledger = dict(env.session_state["sid"]["service_accounting"])
+        assert all(
+            first_ledger[key] == 0.0
+            for key in (
+                "forced_terminated_service_mbps",
+                "cumulative_forced_terminated_service_mbps",
+                "forced_termination_events",
+                "step_forced_terminated_service_mbps",
+                "step_forced_termination_events",
+            )
+        )
+
+        # Model a corrupted carried ledger plus a producer/shared-helper pair
+        # that advances every coupled counter consistently.  A keys-only or
+        # monotonicity-only check would accept this fabricated forced event.
+        env.session_state["sid"]["service_accounting"].update(
+            {
+                "forced_terminated_service_mbps": 1.0,
+                "cumulative_forced_terminated_service_mbps": 1.0,
+                "forced_termination_events": 1.0,
+                "step_forced_terminated_service_mbps": 1.0,
+                "step_forced_termination_events": 1.0,
+            }
+        )
+        second_support = candidate_contract.parse_rendered_support(first_observation)
+        original_step = env.backend.step
+        coupled_breakdown: dict[str, object] = {}
+
+        def corrupted_second_step(*args, **kwargs):
+            next_obs, _reward, done, step_info = original_step(*args, **kwargs)
+            step_info = dict(step_info)
+            ledger = dict(step_info["service_accounting"])
+            ledger.update(
+                {
+                    "forced_terminated_service_mbps": 1.0,
+                    "cumulative_forced_terminated_service_mbps": 2.0,
+                    "forced_termination_events": 2.0,
+                    "step_forced_terminated_service_mbps": 1.0,
+                    "step_forced_termination_events": 1.0,
+                }
+            )
+            measurements = dict(step_info["reward_measurements"])
+            measurements.update(ledger)
+            terms = dict(step_info["reward_terms"])
+            requested = measurements["requested_service_mbps"]
+            forced_ratio = min(1.0, ledger["step_forced_terminated_service_mbps"] / requested)
+            terms["forced_termination"] = -(5.0 + 2.0 * forced_ratio)
+            terms["total"] = sum(value for key, value in terms.items() if key != "total")
+            step_info["service_accounting"] = ledger
+            step_info["reward_measurements"] = measurements
+            step_info["reward_terms"] = terms
+            coupled_breakdown.update(
+                {
+                    "measurements": measurements,
+                    "terms": terms,
+                    "total": terms["total"],
+                }
+            )
+            return next_obs, terms["total"], done, step_info
+
+        monkeypatch.setattr(env.backend, "step", corrupted_second_step)
+        monkeypatch.setattr(
+            app_source,
+            "compute_breakdown",
+            lambda *_args, **_kwargs: coupled_breakdown,
+        )
+        next_observation, reward, terminated, truncated, info = await env.step(
+            _tool_response(
+                second_support.actions[0]["name"],
+                second_support.actions[0]["arguments"],
+            ),
+            {},
+            session_id="sid",
+        )
+        assert next_observation is None
+        assert reward == 0.0 and terminated is False and truncated is True
+        assert info["protocol_rejection"] is True
+        assert info["rejection_reason"].startswith("server_contract_failure:")
+        assert info["environment_transition_discarded"] is True
+        assert info["training_usable"] is False
+        assert "sid" not in env.session_state
+
+    @pytest.mark.asyncio
+    async def test_v10_two_step_quarantines_corrupted_carried_session_ledger(
+        self,
+    ):
+        env = self._env()
+        observation, _ = await env.reset(dict(_V10_TASK_METADATA), session_id="sid")
+        support = candidate_contract.parse_rendered_support(observation)
+        first_observation, _, terminated, truncated, _ = await env.step(
+            _tool_response(support.actions[0]["name"], support.actions[0]["arguments"]),
+            {},
+            session_id="sid",
+        )
+        assert first_observation is not None
+        assert not terminated and not truncated
+
+        # Corrupt only the ledger carried by the server between transitions.
+        # The second backend result remains honest, so quarantine proves the
+        # previous session ledger is actually revalidated at integration time.
+        env.session_state["sid"]["service_accounting"]["requested_service_mbps"] += 1.0
+        second_support = candidate_contract.parse_rendered_support(first_observation)
+        next_observation, reward, terminated, truncated, info = await env.step(
+            _tool_response(
+                second_support.actions[0]["name"],
+                second_support.actions[0]["arguments"],
+            ),
+            {},
+            session_id="sid",
+        )
+        assert next_observation is None
+        assert reward == 0.0 and terminated is False and truncated is True
+        assert info["protocol_rejection"] is True
+        assert info["rejection_reason"].startswith("server_contract_failure:")
+        assert info["environment_transition_discarded"] is True
+        assert info["training_usable"] is False
+        assert "sid" not in env.session_state
+
+    def test_v10_accepts_a_conserving_monotonic_service_ledger(self):
+        assert (
+            OpenAirCongestionEnv._validated_v10_service_accounting(
+                dict(_VALID_V10_SERVICE_ACCOUNTING),
+                previous=dict(_PREVIOUS_V10_SERVICE_ACCOUNTING),
+            )
+            == _VALID_V10_SERVICE_ACCOUNTING
+        )
+
+    @pytest.mark.parametrize(
+        ("mutated", "previous"),
+        [
+            (
+                {**_VALID_V10_SERVICE_ACCOUNTING, "admitted_service_mbps": 11.0},
+                _PREVIOUS_V10_SERVICE_ACCOUNTING,
+            ),
+            (
+                {**_VALID_V10_SERVICE_ACCOUNTING, "delivered_service_mbps": 9.0},
+                _PREVIOUS_V10_SERVICE_ACCOUNTING,
+            ),
+            (
+                {**_VALID_V10_SERVICE_ACCOUNTING, "unadmitted_service_mbps": 1.0},
+                _PREVIOUS_V10_SERVICE_ACCOUNTING,
+            ),
+            (
+                {
+                    **_VALID_V10_SERVICE_ACCOUNTING,
+                    "undelivered_admitted_service_mbps": 1.0,
+                },
+                _PREVIOUS_V10_SERVICE_ACCOUNTING,
+            ),
+            (
+                {
+                    **_VALID_V10_SERVICE_ACCOUNTING,
+                    "forced_terminated_service_mbps": 6.0,
+                },
+                _PREVIOUS_V10_SERVICE_ACCOUNTING,
+            ),
+            (
+                {
+                    **_VALID_V10_SERVICE_ACCOUNTING,
+                    "step_forced_terminated_service_mbps": 6.0,
+                },
+                _PREVIOUS_V10_SERVICE_ACCOUNTING,
+            ),
+            (
+                {**_VALID_V10_SERVICE_ACCOUNTING, "forced_termination_events": 3.5},
+                _PREVIOUS_V10_SERVICE_ACCOUNTING,
+            ),
+            (
+                {
+                    **_VALID_V10_SERVICE_ACCOUNTING,
+                    "step_forced_termination_events": 1.5,
+                },
+                _PREVIOUS_V10_SERVICE_ACCOUNTING,
+            ),
+            (
+                {
+                    **_VALID_V10_SERVICE_ACCOUNTING,
+                    "cumulative_forced_terminated_service_mbps": 2.0,
+                    "step_forced_terminated_service_mbps": 0.0,
+                },
+                _PREVIOUS_V10_SERVICE_ACCOUNTING,
+            ),
+            (
+                {
+                    **_VALID_V10_SERVICE_ACCOUNTING,
+                    "forced_termination_events": 1.0,
+                    "step_forced_termination_events": 0.0,
+                },
+                _PREVIOUS_V10_SERVICE_ACCOUNTING,
+            ),
+            (
+                {
+                    **_VALID_V10_SERVICE_ACCOUNTING,
+                    "step_forced_terminated_service_mbps": 1.0,
+                },
+                _PREVIOUS_V10_SERVICE_ACCOUNTING,
+            ),
+        ],
+        ids=(
+            "admitted-exceeds-requested",
+            "delivered-exceeds-admitted",
+            "unadmitted-does-not-conserve",
+            "undelivered-does-not-conserve",
+            "forced-exceeds-cumulative",
+            "step-forced-exceeds-cumulative",
+            "fractional-cumulative-event-count",
+            "fractional-step-event-count",
+            "cumulative-service-decreases",
+            "cumulative-event-count-decreases",
+            "step-service-does-not-match-delta",
+        ),
+    )
+    def test_v10_rejects_nonconserving_or_nonmonotonic_service_ledgers(
+        self,
+        mutated,
+        previous,
+    ):
+        with pytest.raises(V10ProtocolError, match="service_accounting"):
+            OpenAirCongestionEnv._validated_v10_service_accounting(
+                dict(mutated),
+                previous=None if previous is None else dict(previous),
+            )
+
+    @pytest.mark.asyncio
+    async def test_v10_quarantines_service_accounting_that_disagrees_with_reward_measurements(
+        self,
+        monkeypatch,
+    ):
+        env = self._env()
+        observation, _ = await env.reset(dict(_V10_TASK_METADATA), session_id="sid")
+        support = candidate_contract.parse_rendered_support(observation)
+        original_step = env.backend.step
+
+        def corrupted_step(*args, **kwargs):
+            next_obs, reward, done, step_info = original_step(*args, **kwargs)
+            step_info = dict(step_info)
+            service_accounting = dict(step_info["service_accounting"])
+            service_accounting["requested_service_mbps"] += 1.0
+            step_info["service_accounting"] = service_accounting
+            return next_obs, reward, done, step_info
+
+        monkeypatch.setattr(env.backend, "step", corrupted_step)
+        next_observation, reward, terminated, truncated, info = await env.step(
+            _tool_response(support.actions[0]["name"], support.actions[0]["arguments"]),
+            {},
+            session_id="sid",
+        )
+        assert next_observation is None
+        assert reward == 0.0 and terminated is False and truncated is True
+        assert info["protocol_rejection"] is True
+        assert info["rejection_reason"].startswith("server_contract_failure:")
+        assert info["environment_transition_discarded"] is True
+        assert info["training_usable"] is False
+        assert "sid" not in env.session_state
 
     @pytest.mark.asyncio
     async def test_v10_terminal_quarantines_every_invalid_call_shape(self):
@@ -805,6 +1428,14 @@ class TestV10ConstrainedProtocol:
         assert config["dynamic_congestion_gen_configured"] is True
         assert config["dynamic_congestion_gen_used"] is True
         assert config["scenario_source"] == _V10_SCENARIO_SOURCE
+
+    def test_v10_refuses_reward_coefficient_drift_at_startup(self, monkeypatch):
+        monkeypatch.setattr(
+            "resources_servers.openair_congestion.app.T2_V3_ACTION_WEIGHT",
+            0.123,
+        )
+        with pytest.raises(RuntimeError, match="reviewed reward coefficients"):
+            self._env()
 
     @pytest.mark.asyncio
     async def test_v10_requires_explicit_bounded_task_max_steps(self):

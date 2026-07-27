@@ -33,7 +33,8 @@ RUNB2_V10_PROTOCOL_MODE = "runb2_v10_t2_prb_v1"
 RUNB2_V10_ACTION_EFFECT_CONTRACT_SCHEMA = "openair_runb2_v10_action_effect_source_contract_v1"
 RUNB2_V10_ACTION_SCOPE = "t2_prb_only_synthetic_replay_v1"
 RUNB2_V10_OBSERVATION_RENDER = RESOURCE_CANDIDATE_CONTRACT
-RUNB2_V10_REWARD_PROFILE = "openair_v1"
+RUNB2_V10_REWARD_PROFILE = "openair_t2_v3"
+RUNB2_V10_REWARD_VERSION = "openair_t2_v3"
 RESOURCE_ACTION_ARGUMENT_CONTRACT = "resource_candidate_ue_prb_200_273_v1"
 # V10 deliberately has no caller-selectable capacity normalizer.  The replay
 # environment's T2 generator contract fixes it at 250 Mbps per cell; carrying a
@@ -49,9 +50,9 @@ RUNB2_V10_MAX_STEPS_HARD_CAP = 16
 # support rendered alongside it.  The payload itself travels in response
 # provenance; placing it verbatim in the prompt would create needless token
 # pressure and duplicate a server-authored receipt.
-RUNB2_V10_VISIBLE_BINDING_SCHEMA = "openair_runb2_v10_server_observation_binding_v3"
+RUNB2_V10_VISIBLE_BINDING_SCHEMA = "openair_runb2_v10_server_observation_binding_v4"
 RUNB2_V10_VISIBLE_BINDING_PREFIX = "V10B"
-RUNB2_V10_RUNTIME_MANIFEST_SCHEMA = "openair_runb2_v10_runtime_manifest_v2"
+RUNB2_V10_RUNTIME_MANIFEST_SCHEMA = "openair_runb2_v10_runtime_manifest_v3"
 RUNB2_V10_LAUNCH_CONTRACT_SCHEMA = "openair_runb2_v10_launch_contract_v1"
 
 _VISIBLE_BINDING_KEYS = frozenset(
@@ -87,6 +88,27 @@ _LAUNCH_CONTRACT_BINDING_KEYS = frozenset(
 )
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_RUNB2_V10_REWARD_COEFFICIENT_ITEMS = (
+    ("service_denial", 1.0),
+    ("delivery_gap", 1.25),
+    ("elastic_fairness", 0.25),
+    ("sla", 2.0),
+    ("forced_event", 5.0),
+    ("forced_ratio", 2.0),
+    ("action", 0.005),
+)
+_RUNB2_V10_REWARD_WEIGHT_ITEMS = (
+    ("w_sla", 1.0),
+    ("w_tput", 2.0),
+    ("w_fair", 5.0),
+    ("w_buffer", 0.15),
+    ("w_sla_level", 0.8),
+    ("w_prb_level", 0.4),
+    ("w_access_level", 0.3),
+    ("w_fair_level", 0.35),
+    ("w_action", 0.0),
+    ("w_reject", 0.5),
+)
 
 
 class CandidateContractError(ValueError):
@@ -358,10 +380,23 @@ def _require_sha256(value: Any, *, label: str) -> str:
     return value
 
 
+def runb2_v10_reward_coefficients() -> dict[str, float]:
+    """Return the fixed coefficient vector for the reviewed V10 v3 objective."""
+
+    return dict(_RUNB2_V10_REWARD_COEFFICIENT_ITEMS)
+
+
+def runb2_v10_reward_weights() -> dict[str, float]:
+    """Return the exact generic weight vector sealed into the V10 v3 contract."""
+
+    return dict(_RUNB2_V10_REWARD_WEIGHT_ITEMS)
+
+
 def build_visible_binding_payload(
     *,
     environment_contract: Mapping[str, Any],
     reward_weights: Mapping[str, Any],
+    reward_coefficients: Mapping[str, Any],
     runtime_manifest: Mapping[str, Any],
     launch_contract: Mapping[str, Any],
     support: CandidateSupport,
@@ -386,9 +421,14 @@ def build_visible_binding_payload(
         ),
         "reward_contract": {
             "reward_profile": RUNB2_V10_REWARD_PROFILE,
+            "reward_version": RUNB2_V10_REWARD_VERSION,
             "reward_weights": _canonical_mapping_copy(
                 reward_weights,
                 label="reward_weights",
+            ),
+            "reward_coefficients": _canonical_mapping_copy(
+                reward_coefficients,
+                label="reward_coefficients",
             ),
         },
         "capacity_contract": {
@@ -459,32 +499,49 @@ def validate_visible_binding_payload(value: Any, *, support: CandidateSupport) -
     reward = _require_exact_mapping(
         payload["reward_contract"],
         label="V10 visible binding reward_contract",
-        keys=frozenset({"reward_profile", "reward_weights"}),
+        keys=frozenset(
+            {
+                "reward_profile",
+                "reward_version",
+                "reward_weights",
+                "reward_coefficients",
+            }
+        ),
     )
     if reward["reward_profile"] != RUNB2_V10_REWARD_PROFILE:
         raise CandidateContractError("V10 visible binding reward_profile is wrong")
-    expected_weight_keys = frozenset(
-        {
-            "w_sla",
-            "w_tput",
-            "w_fair",
-            "w_buffer",
-            "w_sla_level",
-            "w_prb_level",
-            "w_access_level",
-            "w_fair_level",
-            "w_action",
-            "w_reject",
-        }
-    )
+    if reward["reward_version"] != RUNB2_V10_REWARD_VERSION:
+        raise CandidateContractError("V10 visible binding reward_version is wrong")
+    expected_weights = runb2_v10_reward_weights()
     weights = _require_exact_mapping(
         reward["reward_weights"],
         label="V10 visible binding reward_weights",
-        keys=expected_weight_keys,
+        keys=frozenset(expected_weights),
     )
-    for key, raw in weights.items():
-        if not isinstance(raw, (int, float)) or isinstance(raw, bool) or not math.isfinite(float(raw)):
-            raise CandidateContractError(f"V10 visible binding reward weight {key} must be finite")
+    for key, expected in expected_weights.items():
+        raw = weights[key]
+        if (
+            not isinstance(raw, (int, float))
+            or isinstance(raw, bool)
+            or not math.isfinite(float(raw))
+            or float(raw) != expected
+        ):
+            raise CandidateContractError(f"V10 visible binding reward weight {key} is wrong")
+    coefficients = _require_exact_mapping(
+        reward["reward_coefficients"],
+        label="V10 visible binding reward_coefficients",
+        keys=frozenset(key for key, _value in _RUNB2_V10_REWARD_COEFFICIENT_ITEMS),
+    )
+    expected_coefficients = runb2_v10_reward_coefficients()
+    for key, expected in expected_coefficients.items():
+        raw = coefficients[key]
+        if (
+            not isinstance(raw, (int, float))
+            or isinstance(raw, bool)
+            or not math.isfinite(float(raw))
+            or float(raw) != expected
+        ):
+            raise CandidateContractError(f"V10 visible binding reward coefficient {key} is wrong")
 
     capacity = _require_exact_mapping(
         payload["capacity_contract"],
@@ -754,6 +811,7 @@ __all__ = [
     "RUNB2_V10_OBSERVATION_RENDER",
     "RUNB2_V10_PROTOCOL_MODE",
     "RUNB2_V10_REWARD_PROFILE",
+    "RUNB2_V10_REWARD_VERSION",
     "RUNB2_V10_RUNTIME_MANIFEST_SCHEMA",
     "RUNB2_V10_VISIBLE_BINDING_PREFIX",
     "RUNB2_V10_VISIBLE_BINDING_SCHEMA",
@@ -770,5 +828,7 @@ __all__ = [
     "parse_rendered_support",
     "support_sha256",
     "text_sha256",
+    "runb2_v10_reward_coefficients",
+    "runb2_v10_reward_weights",
     "validate_visible_binding_payload",
 ]

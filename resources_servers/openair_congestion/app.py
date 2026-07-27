@@ -81,8 +81,18 @@ from openair_congestion import tools as tools_source
 from openair_congestion import v10_fixed_replay as v10_fixed_replay_source
 from openair_congestion.render import to_user_text
 from openair_congestion.replay_env import action_effect_version
-from openair_congestion.rewards import DEFAULT_WEIGHTS, compute_breakdown
-from openair_congestion.schemas import ToolCall
+from openair_congestion.rewards import (
+    DEFAULT_WEIGHTS,
+    T2_V3_ACTION_WEIGHT,
+    T2_V3_DELIVERY_GAP_WEIGHT,
+    T2_V3_DENIAL_WEIGHT,
+    T2_V3_ELASTIC_FAIRNESS_WEIGHT,
+    T2_V3_FORCED_EVENT_WEIGHT,
+    T2_V3_FORCED_RATIO_WEIGHT,
+    T2_V3_SLA_WEIGHT,
+    compute_breakdown,
+)
+from openair_congestion.schemas import Observation, ToolCall
 from openair_congestion.v10_fixed_replay import V10_FIXED_REPLAY_SCENARIO_SOURCE
 
 
@@ -151,7 +161,7 @@ _V10_SESSION_SECRET_MIN_CHARS = 43  # len(secrets.token_urlsafe(32))
 _V10_TASK_BUDGET_RECEIPT_SCHEMA = "openair_runb2_v10_task_budget_receipt_v1"
 _V10_RESET_RECEIPT_SCHEMA = "openair_runb2_v10_reset_receipt_v1"
 _V10_TRANSITION_BINDING_SCHEMA = "openair_runb2_v10_transition_binding_v2"
-_V10_RUNTIME_MANIFEST_SOURCE_SCHEMA = "openair_runb2_v10_runtime_manifest_v2"
+_V10_RUNTIME_MANIFEST_SOURCE_SCHEMA = candidate_contract.RUNB2_V10_RUNTIME_MANIFEST_SCHEMA
 _V10_REPLAY_SCENARIO_SOURCE = V10_FIXED_REPLAY_SCENARIO_SOURCE
 _V10_CONGESTION_GEN_SOURCE_RELATIVE_PATHS = {
     "congestion_gen.package": "services/congestion-gen/congestion_gen/__init__.py",
@@ -174,6 +184,8 @@ _V10_REWARD_TERM_KEYS = frozenset(
         "action",
         "reject",
         "service_denial",
+        "delivery_gap",
+        "elastic_fairness",
         "forced_termination",
         "total",
     }
@@ -206,6 +218,27 @@ _V10_REWARD_MEASUREMENT_KEYS = frozenset(
         "undelivered_admitted_service_mbps",
     }
 )
+_V10_SERVICE_ACCOUNTING_KEYS = frozenset(
+    {
+        "requested_service_mbps",
+        "admitted_service_mbps",
+        "delivered_service_mbps",
+        "forced_terminated_service_mbps",
+        "cumulative_forced_terminated_service_mbps",
+        "forced_termination_events",
+        "step_forced_terminated_service_mbps",
+        "step_forced_termination_events",
+        "unadmitted_service_mbps",
+        "undelivered_admitted_service_mbps",
+    }
+)
+_V10_ZERO_FORCED_SERVICE_ACCOUNTING_KEYS = (
+    "forced_terminated_service_mbps",
+    "cumulative_forced_terminated_service_mbps",
+    "forced_termination_events",
+    "step_forced_terminated_service_mbps",
+    "step_forced_termination_events",
+)
 _V10_SERVER_STEP_RECEIPT_KEYS = frozenset(
     {
         "action",
@@ -225,7 +258,11 @@ _V10_SERVER_STEP_RECEIPT_KEYS = frozenset(
         "kpi_source",
         "dynamics_mode",
         "reward_profile",
+        "reward_version",
         "reward_weights",
+        "reward_coefficients",
+        "service_accounting",
+        "service_accounting_sha256",
         "terminated",
         "truncated",
         "training_usable",
@@ -268,6 +305,251 @@ _V10_RESET_RECEIPT_KEYS = frozenset(
 
 class V10ProtocolError(RuntimeError):
     """The server cannot safely provide the constrained V10 replay contract."""
+
+
+def _v10_reward_coefficients() -> dict[str, float]:
+    """Read the exact reviewed v3 constants used by independent recomputation."""
+
+    observed = {
+        "service_denial": float(T2_V3_DENIAL_WEIGHT),
+        "delivery_gap": float(T2_V3_DELIVERY_GAP_WEIGHT),
+        "elastic_fairness": float(T2_V3_ELASTIC_FAIRNESS_WEIGHT),
+        "sla": float(T2_V3_SLA_WEIGHT),
+        "forced_event": float(T2_V3_FORCED_EVENT_WEIGHT),
+        "forced_ratio": float(T2_V3_FORCED_RATIO_WEIGHT),
+        "action": float(T2_V3_ACTION_WEIGHT),
+    }
+    if observed != candidate_contract.runb2_v10_reward_coefficients():
+        raise V10ProtocolError("V10 runtime reward constants differ from the reviewed reward coefficients")
+    return observed
+
+
+def _v10_reward_weights() -> dict[str, float]:
+    """Fail closed unless the imported generic vector matches the v3 contract."""
+
+    observed = {key: float(value) for key, value in asdict(DEFAULT_WEIGHTS).items()}
+    if observed != candidate_contract.runb2_v10_reward_weights():
+        raise V10ProtocolError("V10 runtime reward weights differ from the reviewed reward vector")
+    return observed
+
+
+def _v10_aggregate_delivered_mbps(observation: Observation) -> float:
+    return float(sum(ue.delivered_mbps for cell in observation.cells for ue in cell.ues))
+
+
+def _v10_mean_jain(observation: Observation) -> float:
+    if not observation.cells:
+        return 1.0
+    return float(sum(cell.fairness_jain for cell in observation.cells) / len(observation.cells))
+
+
+def _v10_mean_elastic_jain(observation: Observation) -> float:
+    if not observation.cells:
+        return 1.0
+    values: list[float] = []
+    for cell in observation.cells:
+        delivered = [max(0.0, float(ue.delivered_mbps)) for ue in cell.ues if int(ue.qos_5qi) == 9]
+        if not delivered or sum(delivered) <= 0.0:
+            values.append(1.0)
+            continue
+        total = sum(delivered)
+        squares = sum(value * value for value in delivered)
+        values.append((total * total) / max(1.0e-9, len(delivered) * squares))
+    return float(sum(values) / len(values))
+
+
+def _v10_sla_count(observation: Observation) -> int:
+    return int(sum(cell.sla_violations_last_window for cell in observation.cells))
+
+
+def _v10_n_ues(observation: Observation) -> int:
+    return max(1, sum(len(cell.ues) for cell in observation.cells))
+
+
+def _v10_mean_prb_pressure(
+    observation: Observation,
+    *,
+    threshold: float = 0.85,
+) -> float:
+    if not observation.cells:
+        return 0.0
+    denominator = max(1.0e-6, 1.0 - threshold)
+    return float(
+        sum(max(0.0, cell.prb_util_dl_p99 - threshold) / denominator for cell in observation.cells)
+        / len(observation.cells)
+    )
+
+
+def _v10_mean_access_pressure(
+    observation: Observation,
+    *,
+    threshold: float = 0.05,
+) -> float:
+    if not observation.cells:
+        return 0.0
+    denominator = max(1.0e-6, 0.5 - threshold)
+    return float(
+        sum(max(0.0, cell.prach_collision_rate - threshold) / denominator for cell in observation.cells)
+        / len(observation.cells)
+    )
+
+
+def _v10_mean_fairness_deficit(
+    observation: Observation,
+    *,
+    target: float = 0.80,
+) -> float:
+    if not observation.cells:
+        return 0.0
+    denominator = max(1.0e-6, target)
+    return float(
+        sum(max(0.0, target - cell.fairness_jain) / denominator for cell in observation.cells) / len(observation.cells)
+    )
+
+
+def _v10_mean_buffer_pressure(
+    observation: Observation,
+    *,
+    buffer_capacity_kb: float = 1024.0,
+) -> float:
+    ues = [ue for cell in observation.cells for ue in cell.ues]
+    if not ues:
+        return 0.0
+    denominator = max(1.0e-6, buffer_capacity_kb)
+    return float(sum(max(0.0, (ue.buffer_occupancy_kb / denominator) - 0.7) for ue in ues) / len(ues))
+
+
+def _v10_server_local_service_accounting(
+    observation: Observation,
+) -> dict[str, float]:
+    """Derive the PRB-only replay ledger from policy-visible UE service state."""
+
+    requested = 0.0
+    admitted = 0.0
+    delivered = 0.0
+    tolerance = 1.0e-9
+    for cell in observation.cells:
+        for ue in cell.ues:
+            ue_requested = float(ue.requested_mbps if ue.requested_mbps is not None else ue.offered_mbps)
+            ue_admitted = float(ue.admitted_mbps if ue.admitted_mbps is not None else ue.offered_mbps)
+            ue_delivered = float(ue.delivered_mbps)
+            if ue_requested + tolerance < ue_admitted:
+                raise V10ProtocolError("server-local replay service accounting violates requested >= admitted")
+            requested += ue_requested
+            admitted += ue_admitted
+            delivered += min(ue_delivered, ue_admitted)
+    if requested + tolerance < admitted or admitted + tolerance < delivered:
+        raise V10ProtocolError("server-local replay service accounting conservation drifted")
+    return {
+        "requested_service_mbps": requested,
+        "admitted_service_mbps": admitted,
+        "delivered_service_mbps": delivered,
+        "forced_terminated_service_mbps": 0.0,
+        "cumulative_forced_terminated_service_mbps": 0.0,
+        "forced_termination_events": 0.0,
+        "step_forced_terminated_service_mbps": 0.0,
+        "step_forced_termination_events": 0.0,
+        "unadmitted_service_mbps": max(0.0, requested - admitted),
+        "undelivered_admitted_service_mbps": max(0.0, admitted - delivered),
+    }
+
+
+def _v10_server_local_reward_breakdown(
+    *,
+    prev_observation: Observation | None,
+    next_observation: Observation,
+    action: ToolCall,
+    accepted: bool,
+    service_accounting: dict[str, float],
+) -> dict[str, Any]:
+    """Independently recompute the complete v3 arithmetic in server-local code."""
+
+    rejected = not accepted
+    if prev_observation is None:
+        delta_sla = 0
+        delta_delivered = 0.0
+        delta_jain = 0.0
+    else:
+        delta_sla = _v10_sla_count(prev_observation) - _v10_sla_count(next_observation)
+        delta_delivered = _v10_aggregate_delivered_mbps(next_observation) - _v10_aggregate_delivered_mbps(
+            prev_observation
+        )
+        delta_jain = _v10_mean_jain(next_observation) - _v10_mean_jain(prev_observation)
+        if rejected:
+            delta_sla = min(0, delta_sla)
+            delta_delivered = min(0.0, delta_delivered)
+            delta_jain = min(0.0, delta_jain)
+
+    n_ues = _v10_n_ues(next_observation)
+    cell_capacity_total = max(
+        1.0e-6,
+        candidate_contract.RUNB2_V10_CELL_CAPACITY_MBPS * max(1, next_observation.global_.n_cells),
+    )
+    measurements = {
+        "delta_sla_violations": float(delta_sla),
+        "delta_delivered_mbps": float(delta_delivered),
+        "delta_jain_fairness": float(delta_jain),
+        "sla_violations": float(_v10_sla_count(next_observation)),
+        "aggregate_delivered_mbps": _v10_aggregate_delivered_mbps(next_observation),
+        "mean_jain_fairness": _v10_mean_jain(next_observation),
+        "mean_elastic_jain_fairness": _v10_mean_elastic_jain(next_observation),
+        "prb_pressure": _v10_mean_prb_pressure(next_observation),
+        "access_pressure": _v10_mean_access_pressure(next_observation),
+        "fairness_deficit": _v10_mean_fairness_deficit(next_observation),
+        "buffer_pressure": _v10_mean_buffer_pressure(next_observation),
+        "action_l1_norm": 0.0 if action.name == "noop" else 1.0,
+        "cell_capacity_mbps_total": float(cell_capacity_total),
+        "n_ues": float(n_ues),
+        **service_accounting,
+    }
+
+    requested = measurements["requested_service_mbps"]
+    if requested > 0.0:
+        denial_ratio = min(
+            1.0,
+            measurements["unadmitted_service_mbps"] / requested,
+        )
+        delivery_gap_ratio = min(
+            1.0,
+            measurements["undelivered_admitted_service_mbps"] / requested,
+        )
+        forced_ratio = min(
+            1.0,
+            measurements["step_forced_terminated_service_mbps"] / requested,
+        )
+    else:
+        denial_ratio = 0.0
+        delivery_gap_ratio = 0.0
+        forced_ratio = 0.0
+    coefficients = _v10_reward_coefficients()
+    reward_weights = _v10_reward_weights()
+    terms = {
+        "delta_sla": 0.0,
+        "delta_tput": 0.0,
+        "delta_fair": 0.0,
+        "level_sla": -coefficients["sla"] * (_v10_sla_count(next_observation) / n_ues),
+        "level_prb": 0.0,
+        "level_access": 0.0,
+        "level_fair": 0.0,
+        "level_buffer": 0.0,
+        "action": (-coefficients["action"] * measurements["action_l1_norm"] if accepted else 0.0),
+        "reject": -reward_weights["w_reject"] if rejected else 0.0,
+        "service_denial": -coefficients["service_denial"] * denial_ratio,
+        "delivery_gap": -coefficients["delivery_gap"] * delivery_gap_ratio,
+        "elastic_fairness": -coefficients["elastic_fairness"]
+        * max(0.0, 1.0 - measurements["mean_elastic_jain_fairness"]),
+        "forced_termination": -(
+            coefficients["forced_event"] * measurements["step_forced_termination_events"]
+            + coefficients["forced_ratio"] * forced_ratio
+        ),
+    }
+    total = float(sum(terms.values()))
+    terms["total"] = total
+    return {
+        "measurements": measurements,
+        "terms": terms,
+        "total": total,
+    }
 
 
 class OpenAirCongestionEnv(GymnasiumServer):
@@ -501,7 +783,9 @@ class OpenAirCongestionEnv(GymnasiumServer):
             "agent_max_steps": self.config.agent_max_steps,
             "num_workers": 1 if self.config.num_workers is None else self.config.num_workers,
             "reward_profile": candidate_contract.RUNB2_V10_REWARD_PROFILE,
-            "reward_weights": asdict(DEFAULT_WEIGHTS),
+            "reward_version": candidate_contract.RUNB2_V10_REWARD_VERSION,
+            "reward_weights": _v10_reward_weights(),
+            "reward_coefficients": _v10_reward_coefficients(),
             "scenario_source": _V10_REPLAY_SCENARIO_SOURCE,
             "dynamic_congestion_gen_importable": True,
             "dynamic_congestion_gen_configured": True,
@@ -683,7 +967,9 @@ class OpenAirCongestionEnv(GymnasiumServer):
             "dynamics_mode": action_effect_version(),
             "action_affects_observation": True,
             "reward_profile": candidate_contract.RUNB2_V10_REWARD_PROFILE,
-            "reward_weights": asdict(DEFAULT_WEIGHTS),
+            "reward_version": candidate_contract.RUNB2_V10_REWARD_VERSION,
+            "reward_weights": _v10_reward_weights(),
+            "reward_coefficients": _v10_reward_coefficients(),
             # The V10B row carries the compact reference; expose the complete
             # server-authored object alongside the HTTP provenance so a source
             # builder can seal and independently rehash it without trusting a
@@ -699,7 +985,8 @@ class OpenAirCongestionEnv(GymnasiumServer):
             support = candidate_contract.build_t2_prb_support(observation)
             binding_payload = candidate_contract.build_visible_binding_payload(
                 environment_contract=self._v10_environment_contract(),
-                reward_weights=asdict(DEFAULT_WEIGHTS),
+                reward_weights=_v10_reward_weights(),
+                reward_coefficients=_v10_reward_coefficients(),
                 runtime_manifest=self._v10_runtime_manifest_ref(),
                 launch_contract=self._v10_launch_contract(),
                 support=support,
@@ -1002,6 +1289,105 @@ class OpenAirCongestionEnv(GymnasiumServer):
             if not math.isclose(actual[key], expected_value, rel_tol=0.0, abs_tol=1.0e-12):
                 raise V10ProtocolError(f"{label}.{key} differs from the recomputed V10 reward")
 
+    @classmethod
+    def _validated_v10_service_accounting(
+        cls,
+        value: Any,
+        *,
+        previous: Any,
+    ) -> dict[str, float]:
+        """Validate the exact, conserving, monotonic ten-field service ledger."""
+
+        ledger = cls._finite_mapping(
+            value,
+            label="service_accounting",
+            expected_keys=_V10_SERVICE_ACCOUNTING_KEYS,
+        )
+        if any(item < 0.0 for item in ledger.values()):
+            raise V10ProtocolError("service_accounting must contain only nonnegative values")
+        if any(ledger[key] != 0.0 for key in _V10_ZERO_FORCED_SERVICE_ACCOUNTING_KEYS):
+            raise V10ProtocolError("PRB-only V10 service_accounting forced fields must be exactly zero")
+
+        requested = ledger["requested_service_mbps"]
+        admitted = ledger["admitted_service_mbps"]
+        delivered = ledger["delivered_service_mbps"]
+
+        def close(left: float, right: float) -> bool:
+            return math.isclose(left, right, rel_tol=0.0, abs_tol=1.0e-9)
+
+        if (admitted > requested and not close(admitted, requested)) or (
+            delivered > admitted and not close(delivered, admitted)
+        ):
+            raise V10ProtocolError("service_accounting violates requested >= admitted >= delivered")
+        if not close(
+            ledger["unadmitted_service_mbps"],
+            requested - admitted,
+        ) or not close(
+            ledger["undelivered_admitted_service_mbps"],
+            admitted - delivered,
+        ):
+            raise V10ProtocolError("service_accounting violates service conservation")
+
+        forced = ledger["forced_terminated_service_mbps"]
+        cumulative_forced = ledger["cumulative_forced_terminated_service_mbps"]
+        forced_events = ledger["forced_termination_events"]
+        step_forced = ledger["step_forced_terminated_service_mbps"]
+        step_events = ledger["step_forced_termination_events"]
+        if (
+            (forced > cumulative_forced and not close(forced, cumulative_forced))
+            or (step_forced > cumulative_forced and not close(step_forced, cumulative_forced))
+            or not forced_events.is_integer()
+            or not step_events.is_integer()
+        ):
+            raise V10ProtocolError("service_accounting has invalid forced-service counters")
+
+        if previous is None:
+            previous_cumulative_forced = 0.0
+            previous_forced_events = 0.0
+        else:
+            prior = cls._finite_mapping(
+                previous,
+                label="previous service_accounting",
+                expected_keys=_V10_SERVICE_ACCOUNTING_KEYS,
+            )
+            if any(item < 0.0 for item in prior.values()):
+                raise V10ProtocolError("previous service_accounting must contain only nonnegative values")
+            if any(prior[key] != 0.0 for key in _V10_ZERO_FORCED_SERVICE_ACCOUNTING_KEYS):
+                raise V10ProtocolError("PRB-only V10 previous service_accounting forced fields must be exactly zero")
+            prior_requested = prior["requested_service_mbps"]
+            prior_admitted = prior["admitted_service_mbps"]
+            prior_delivered = prior["delivered_service_mbps"]
+            if (prior_admitted > prior_requested and not close(prior_admitted, prior_requested)) or (
+                prior_delivered > prior_admitted and not close(prior_delivered, prior_admitted)
+            ):
+                raise V10ProtocolError("previous service_accounting violates requested >= admitted >= delivered")
+            if not close(
+                prior["unadmitted_service_mbps"],
+                prior_requested - prior_admitted,
+            ) or not close(
+                prior["undelivered_admitted_service_mbps"],
+                prior_admitted - prior_delivered,
+            ):
+                raise V10ProtocolError("previous service_accounting violates service conservation")
+            previous_cumulative_forced = prior["cumulative_forced_terminated_service_mbps"]
+            previous_forced_events = prior["forced_termination_events"]
+            if not previous_forced_events.is_integer() or not prior["step_forced_termination_events"].is_integer():
+                raise V10ProtocolError("previous service_accounting has fractional forced-service counters")
+
+        if (
+            cumulative_forced < previous_cumulative_forced and not close(cumulative_forced, previous_cumulative_forced)
+        ) or forced_events < previous_forced_events:
+            raise V10ProtocolError("service_accounting cumulative forced-service counters decreased")
+        if not close(
+            step_forced,
+            cumulative_forced - previous_cumulative_forced,
+        ) or not close(
+            step_events,
+            forced_events - previous_forced_events,
+        ):
+            raise V10ProtocolError("service_accounting step counters differ from cumulative deltas")
+        return ledger
+
     def _validated_v10_reward_info(
         self,
         *,
@@ -1012,21 +1398,41 @@ class OpenAirCongestionEnv(GymnasiumServer):
         action: ToolCall,
         pre_support: candidate_contract.CandidateSupport,
         post_support: candidate_contract.CandidateSupport,
-    ) -> tuple[dict[str, float], dict[str, float], bool]:
+        previous_service_accounting: Any,
+    ) -> tuple[dict[str, float], dict[str, float], dict[str, float], bool]:
         """Prove replay reported the exact, complete reward we independently recompute."""
 
         if step_info.get("kpi_source") != "replay":
             raise V10ProtocolError("V10 replay step returned a non-replay KPI source")
         if step_info.get("dynamics_mode") != action_effect_version():
             raise V10ProtocolError("V10 replay step returned the wrong dynamics identity")
+        if step_info.get("reward_version") != candidate_contract.RUNB2_V10_REWARD_VERSION:
+            raise V10ProtocolError("V10 replay step returned the wrong reward_version")
         accepted = step_info.get("guardrail_accepted")
         if type(accepted) is not bool:
             raise V10ProtocolError("V10 replay step must report boolean guardrail_accepted")
+        service_accounting = self._validated_v10_service_accounting(
+            step_info.get("service_accounting"),
+            previous=previous_service_accounting,
+        )
+        self._assert_close_mapping(
+            service_accounting,
+            _v10_server_local_service_accounting(next_observation),
+            label="service_accounting",
+        )
         measurements = self._finite_mapping(
             step_info.get("reward_measurements"),
             label="reward_measurements",
             expected_keys=_V10_REWARD_MEASUREMENT_KEYS,
         )
+        for key, accounting_value in service_accounting.items():
+            if not math.isclose(
+                measurements[key],
+                accounting_value,
+                rel_tol=0.0,
+                abs_tol=1.0e-12,
+            ):
+                raise V10ProtocolError(f"reward_measurements.{key} differs from service_accounting")
         pre_capacity_rows = [dict(row) for row in pre_support.capacity_milli_mbps_by_cell]
         post_capacity_rows = [dict(row) for row in post_support.capacity_milli_mbps_by_cell]
         if pre_capacity_rows != post_capacity_rows:
@@ -1053,42 +1459,111 @@ class OpenAirCongestionEnv(GymnasiumServer):
             float(reward), terms["total"], rel_tol=0.0, abs_tol=1.0e-9
         ):
             raise V10ProtocolError("step scalar reward differs from reward_terms.total")
-        recomputed = compute_breakdown(
+        local_recomputed = _v10_server_local_reward_breakdown(
+            prev_observation=prev_observation,
+            next_observation=next_observation,
+            action=action,
+            accepted=accepted,
+            service_accounting=service_accounting,
+        )
+        local_measurements = self._finite_mapping(
+            local_recomputed.get("measurements"),
+            label="server_local_reward_measurements",
+            expected_keys=_V10_REWARD_MEASUREMENT_KEYS,
+        )
+        local_terms = self._finite_mapping(
+            local_recomputed.get("terms"),
+            label="server_local_reward_terms",
+            expected_keys=_V10_REWARD_TERM_KEYS,
+        )
+        local_total = local_recomputed.get("total")
+        if (
+            not isinstance(local_total, (int, float))
+            or isinstance(local_total, bool)
+            or not math.isfinite(float(local_total))
+            or not math.isclose(
+                float(local_total),
+                local_terms["total"],
+                rel_tol=0.0,
+                abs_tol=1.0e-12,
+            )
+        ):
+            raise V10ProtocolError("server-local V10 reward did not produce a finite total")
+        self._assert_close_mapping(
+            measurements,
+            local_measurements,
+            label="reward_measurements",
+        )
+        self._assert_close_mapping(
+            terms,
+            local_terms,
+            label="reward_terms",
+        )
+        if not math.isclose(
+            float(reward),
+            float(local_total),
+            rel_tol=0.0,
+            abs_tol=1.0e-12,
+        ):
+            raise V10ProtocolError("step scalar reward differs from server-local V10 reward")
+
+        shared_recomputed = compute_breakdown(
             prev_obs=prev_observation,
             curr_obs=next_observation,
             action=action,
             rejected=not accepted,
             weights=DEFAULT_WEIGHTS,
             cell_capacity_mbps=candidate_contract.RUNB2_V10_CELL_CAPACITY_MBPS,
-            reward_version=candidate_contract.RUNB2_V10_REWARD_PROFILE,
+            service_accounting=service_accounting,
+            reward_version=candidate_contract.RUNB2_V10_REWARD_VERSION,
         )
-        expected_measurements = self._finite_mapping(
-            recomputed.get("measurements"),
-            label="recomputed_reward_measurements",
+        shared_measurements = self._finite_mapping(
+            shared_recomputed.get("measurements"),
+            label="shared_reward_measurements",
             expected_keys=_V10_REWARD_MEASUREMENT_KEYS,
         )
-        expected_terms = self._finite_mapping(
-            recomputed.get("terms"),
-            label="recomputed_reward_terms",
+        shared_terms = self._finite_mapping(
+            shared_recomputed.get("terms"),
+            label="shared_reward_terms",
             expected_keys=_V10_REWARD_TERM_KEYS,
         )
-        expected_total = recomputed.get("total")
+        shared_total = shared_recomputed.get("total")
         if (
-            not isinstance(expected_total, (int, float))
-            or isinstance(expected_total, bool)
-            or not math.isfinite(float(expected_total))
-            or not math.isclose(float(expected_total), expected_terms["total"], rel_tol=0.0, abs_tol=1.0e-12)
+            not isinstance(shared_total, (int, float))
+            or isinstance(shared_total, bool)
+            or not math.isfinite(float(shared_total))
+            or not math.isclose(
+                float(shared_total),
+                shared_terms["total"],
+                rel_tol=0.0,
+                abs_tol=1.0e-12,
+            )
         ):
-            raise V10ProtocolError("recomputed V10 reward did not produce a finite total")
+            raise V10ProtocolError("shared V10 reward helper did not produce a finite total")
+        self._assert_close_mapping(
+            shared_measurements,
+            local_measurements,
+            label="shared_reward_measurements",
+        )
+        self._assert_close_mapping(
+            shared_terms,
+            local_terms,
+            label="shared_reward_terms",
+        )
+        if not math.isclose(
+            float(shared_total),
+            float(local_total),
+            rel_tol=0.0,
+            abs_tol=1.0e-12,
+        ):
+            raise V10ProtocolError("shared reward total differs from server-local V10 reward")
         self._assert_close_mapping(
             measurements,
-            expected_measurements,
+            shared_measurements,
             label="reward_measurements",
         )
-        self._assert_close_mapping(terms, expected_terms, label="reward_terms")
-        if not math.isclose(float(reward), float(expected_total), rel_tol=0.0, abs_tol=1.0e-12):
-            raise V10ProtocolError("step scalar reward differs from recomputed V10 reward")
-        return measurements, terms, accepted
+        self._assert_close_mapping(terms, shared_terms, label="reward_terms")
+        return measurements, terms, service_accounting, accepted
 
     @staticmethod
     def _v10_server_step_receipt(
@@ -1097,6 +1572,7 @@ class OpenAirCongestionEnv(GymnasiumServer):
         scalar_reward: float,
         reward_measurements: dict[str, float],
         reward_terms: dict[str, float],
+        service_accounting: dict[str, float],
         guardrail_accepted: bool,
         submitted_candidate_support_sha256: str,
         submitted_candidate_supported: bool,
@@ -1135,7 +1611,11 @@ class OpenAirCongestionEnv(GymnasiumServer):
             "kpi_source": "replay",
             "dynamics_mode": action_effect_version(),
             "reward_profile": candidate_contract.RUNB2_V10_REWARD_PROFILE,
-            "reward_weights": asdict(DEFAULT_WEIGHTS),
+            "reward_version": candidate_contract.RUNB2_V10_REWARD_VERSION,
+            "reward_weights": _v10_reward_weights(),
+            "reward_coefficients": _v10_reward_coefficients(),
+            "service_accounting": json.loads(candidate_contract.canonical_json(service_accounting)),
+            "service_accounting_sha256": candidate_contract.canonical_json_sha256(service_accounting),
             "terminated": terminated,
             "truncated": truncated,
             "training_usable": training_usable,
@@ -1363,7 +1843,7 @@ class OpenAirCongestionEnv(GymnasiumServer):
             )
         try:
             next_support = self._v10_support_for_observation(next_obs)
-            measurements, terms, accepted = self._validated_v10_reward_info(
+            measurements, terms, service_accounting, accepted = self._validated_v10_reward_info(
                 reward=float(reward),
                 step_info=step_info,
                 prev_observation=prev_observation,
@@ -1371,6 +1851,7 @@ class OpenAirCongestionEnv(GymnasiumServer):
                 action=tool_call,
                 pre_support=support,
                 post_support=next_support,
+                previous_service_accounting=state.get("service_accounting"),
             )
             next_static_info = self._v10_static_info(next_support)
             transition_binding = self._v10_transition_binding(
@@ -1400,6 +1881,7 @@ class OpenAirCongestionEnv(GymnasiumServer):
             )
         state["candidate_support"] = next_support
         state["last_observation"] = next_obs
+        state["service_accounting"] = dict(service_accounting)
         state["cumulative_reward"] += float(reward)
         state["n_steps"] += 1
         rejection_reason = step_info.get("rejection_reason")
@@ -1420,6 +1902,7 @@ class OpenAirCongestionEnv(GymnasiumServer):
             scalar_reward=float(reward),
             reward_measurements=measurements,
             reward_terms=terms,
+            service_accounting=service_accounting,
             guardrail_accepted=accepted,
             submitted_candidate_support_sha256=support.support_sha256,
             submitted_candidate_supported=True,
@@ -1463,6 +1946,8 @@ class OpenAirCongestionEnv(GymnasiumServer):
             "step_idx": step_info.get("step_idx", state["n_steps"]),
             "reward_measurements": measurements,
             "reward_terms": terms,
+            "service_accounting": json.loads(candidate_contract.canonical_json(service_accounting)),
+            "service_accounting_sha256": candidate_contract.canonical_json_sha256(service_accounting),
             "kpi_source": step_info["kpi_source"],
             "terminated": terminated,
             "truncated": truncated,
