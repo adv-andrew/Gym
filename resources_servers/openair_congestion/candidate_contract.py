@@ -52,7 +52,7 @@ RUNB2_V10_MAX_STEPS_HARD_CAP = 16
 # pressure and duplicate a server-authored receipt.
 RUNB2_V10_VISIBLE_BINDING_SCHEMA = "openair_runb2_v10_server_observation_binding_v4"
 RUNB2_V10_VISIBLE_BINDING_PREFIX = "V10B"
-RUNB2_V10_RUNTIME_MANIFEST_SCHEMA = "openair_runb2_v10_runtime_manifest_v3"
+RUNB2_V10_RUNTIME_MANIFEST_SCHEMA = "openair_runb2_v10_runtime_manifest_v4"
 RUNB2_V10_LAUNCH_CONTRACT_SCHEMA = "openair_runb2_v10_launch_contract_v1"
 
 _VISIBLE_BINDING_KEYS = frozenset(

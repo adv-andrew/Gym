@@ -168,6 +168,44 @@ _V10_CONGESTION_GEN_SOURCE_PATHS = {
     "congestion_gen.schemas": "services/congestion-gen/congestion_gen/schemas.py",
     "congestion_gen.validate": "services/congestion-gen/congestion_gen/validate.py",
 }
+_V10_EXPECTED_RUNTIME_SOURCE_IDS = frozenset(
+    {
+        "resource_server.app",
+        "resource_server.backends",
+        "resource_server.candidate_contract",
+        "gymnasium.package",
+        "gymnasium.base",
+        "nemo_gym.package",
+        "nemo_gym.package_info",
+        "nemo_gym.cli.package",
+        "nemo_gym.cli.compat",
+        "nemo_gym.base_resources_server",
+        "nemo_gym.server_utils",
+        "nemo_gym.openai_utils",
+        "nemo_gym.config_types",
+        "nemo_gym.global_config",
+        "nemo_gym.reward_profile",
+        "nemo_gym.profiling",
+        "openair_congestion.package",
+        "openair_congestion.env",
+        "openair_congestion.guardrail",
+        "openair_congestion.kpi_client",
+        "openair_congestion.render",
+        "openair_congestion.replay_env",
+        "openair_congestion.rewards",
+        "openair_congestion.schemas",
+        "openair_congestion.t2_action_mask",
+        "openair_congestion.t2_candidate_sampler",
+        "openair_congestion.t2_policy_features",
+        "openair_congestion.tools",
+        "openair_congestion.v10_fixed_replay",
+        "congestion_gen.package",
+        "congestion_gen.materializer",
+        "congestion_gen.sampler",
+        "congestion_gen.schemas",
+        "congestion_gen.validate",
+    }
+)
 _V10_EXPECTED_REWARD_WEIGHTS = {
     "w_sla": 1.0,
     "w_tput": 2.0,
@@ -444,8 +482,10 @@ class TestV10ConstrainedProtocol:
             info["server_runtime_manifest"]
         )
         runtime_manifest = info["server_runtime_manifest"]
+        assert runtime_manifest["schema_version"] == "openair_runb2_v10_runtime_manifest_v4"
         runtime_source_files = runtime_manifest["source_files"]
-        assert "openair_congestion.t2_candidate_sampler" in runtime_source_files
+        assert len(runtime_source_files) == 34
+        assert set(runtime_source_files) == _V10_EXPECTED_RUNTIME_SOURCE_IDS
         public_config = runtime_manifest["effective_public_config"]
         assert public_config["scenario_source"] == _V10_SCENARIO_SOURCE
         assert public_config["replay_scenario_source"] == _V10_SCENARIO_SOURCE
