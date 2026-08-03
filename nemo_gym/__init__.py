@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import sys
 from os import environ
 from pathlib import Path
 
@@ -34,8 +33,6 @@ WORKING_DIR = PARENT_DIR if _is_editable_install else Path.cwd()
 
 CACHE_DIR = WORKING_DIR / "cache"
 RESULTS_DIR = WORKING_DIR / "results"
-
-sys.path.append(str(PARENT_DIR))
 
 
 def _resolve_under_cwd_or_install(path) -> Path:
