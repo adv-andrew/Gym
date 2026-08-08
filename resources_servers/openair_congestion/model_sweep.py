@@ -29,7 +29,8 @@ replay backend. LLM policies are described in a JSON file (see --models):
 
     [{"label": "frontier", "model": "<frontier-model>", "base_url": "https://api.example/v1",
       "api_key_env": "FRONTIER_API_KEY", "temperature": 0.2, "top_p": 0.95,
-      "max_tokens": 512, "capability_rank": 2}]
+      "max_tokens": 512, "chat_template_kwargs": {"enable_thinking": false},
+      "capability_rank": 2}]
 
 Each model receives every task row's own messages (system prompt + task
 prompt), the current rendered observation as the latest user message, and the
@@ -42,6 +43,10 @@ parseable call the environment rejects as an unknown tool is counted as
 invalid; and a dead endpoint drops the episode as an infrastructure error.
 Dropped episodes are drained server-side, so one model's failures never starve
 the pool for the next. Unparseable replies are never upgraded to valid noops.
+Generic exploratory sweeps may omit ``chat_template_kwargs``. The named Run 1B
+smoke and compliance profiles require Qwen3 thinking to be explicitly disabled
+so its tool-only 512-token budget cannot be consumed by hidden reasoning before
+the native tool call.
 
 Usage:
     python resources_servers/openair_congestion/model_sweep.py
@@ -307,6 +312,11 @@ class ModelSpec:
     temperature: float = 0.2
     top_p: float = 0.95
     max_tokens: int = 512
+    # OpenAI-compatible servers may expose model-specific chat-template
+    # controls. Keep this deliberately narrow: Run 1B only needs Qwen3's
+    # documented thinking switch, and forwarding arbitrary template kwargs
+    # would create an unreviewed prompt-contract surface.
+    chat_template_kwargs: dict[str, bool] | None = None
     # Increasing integers encode the expected capability order. When two or
     # more models are configured, every model must have a unique rank.
     capability_rank: int | None = None
@@ -343,6 +353,21 @@ class ModelSpec:
             raise ValueError(
                 f"capability_rank must be a positive integer when provided, got {self.capability_rank!r}"
             )
+        if self.chat_template_kwargs is not None:
+            if (
+                not isinstance(self.chat_template_kwargs, dict)
+                or set(self.chat_template_kwargs) != {"enable_thinking"}
+                or not isinstance(self.chat_template_kwargs.get("enable_thinking"), bool)
+            ):
+                raise ValueError(
+                    "chat_template_kwargs must be omitted or exactly "
+                    "{'enable_thinking': <boolean>}"
+                )
+            # Do not retain a caller-owned mutable mapping that could change
+            # after validation and silently alter later model requests.
+            self.chat_template_kwargs = {
+                "enable_thinking": self.chat_template_kwargs["enable_thinking"]
+            }
 
 
 def _require_ranked_models(specs: list[ModelSpec], profile_name: str) -> None:
@@ -375,6 +400,12 @@ def _require_run1b_sampling(specs: list[ModelSpec]) -> None:
                 "Run 1B requires the frozen sampling contract "
                 f"temperature={expected[0]}, top_p={expected[1]}, max_tokens={expected[2]}; "
                 f"model {spec.label!r} declared {observed}"
+            )
+        if spec.chat_template_kwargs != {"enable_thinking": False}:
+            raise ValueError(
+                "Run 1B requires chat_template_kwargs exactly "
+                "{'enable_thinking': false}; "
+                f"model {spec.label!r} declared {spec.chat_template_kwargs!r}"
             )
 
 
@@ -805,6 +836,8 @@ async def _llm_action(
         "max_tokens": spec.max_tokens,
         "seed": _request_seed(row, step_idx),
     }
+    if spec.chat_template_kwargs is not None:
+        payload["chat_template_kwargs"] = dict(spec.chat_template_kwargs)
     async with session.post(
         f"{spec.base_url.rstrip('/')}/chat/completions",
         json=payload,
@@ -1199,11 +1232,19 @@ async def _sweep(
     if len(ranks) != len(set(ranks)):
         raise ValueError("model capability_rank values must be unique")
     sampling_contracts = {
-        (float(spec.temperature), float(spec.top_p), spec.max_tokens)
+        (
+            float(spec.temperature),
+            float(spec.top_p),
+            spec.max_tokens,
+            json.dumps(spec.chat_template_kwargs, allow_nan=False, sort_keys=True),
+        )
         for spec in specs
     }
     if len(sampling_contracts) > 1:
-        raise ValueError("all models must use identical sampling parameters: temperature, top_p, and max_tokens")
+        raise ValueError(
+            "all models must use identical sampling and chat-template settings: "
+            "temperature, top_p, max_tokens, and chat_template_kwargs"
+        )
     if run1b_profile:
         _require_run1b_sampling(specs)
 
@@ -1319,6 +1360,11 @@ async def _sweep(
             "seed_version": _REQUEST_SEED_VERSION,
             "tool_choice": "required",
             "parallel_tool_calls": False,
+            "chat_template_kwargs": (
+                dict(specs[0].chat_template_kwargs)
+                if specs[0].chat_template_kwargs is not None
+                else None
+            ),
         }
     return {
         "backend": "replay",

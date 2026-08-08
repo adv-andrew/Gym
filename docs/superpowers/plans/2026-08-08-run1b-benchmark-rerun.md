@@ -21,9 +21,12 @@ Files:
 - Modify `resources_servers/openair_congestion/sweep_models.example.json`
 - Modify `resources_servers/openair_congestion/tests/test_model_sweep.py`
 
-Add explicit `top_p` and a deterministic request seed derived from prompt,
-response, and step. Validate finite/range-safe sampling parameters. Confirm the
-mock endpoint receives the exact same sampling contract for every model.
+Add explicit `top_p`, a deterministic request seed derived from prompt,
+response, and step, and the reviewed Qwen3 chat-template control. Validate
+finite/range-safe sampling parameters and strictly constrain template kwargs.
+Confirm the mock endpoint receives the exact same sampling and template
+contract for every model; named Run 1B profiles require
+`{"enable_thinking": false}` while generic sweeps may omit it.
 
 ## Task 3: Build deterministic reporting and custody packaging
 

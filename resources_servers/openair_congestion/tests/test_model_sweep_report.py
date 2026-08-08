@@ -230,6 +230,7 @@ def _raw_report(scenarios: list[str] | None = None) -> dict[str, Any]:
             "seed_version": "run1b-request-v1",
             "tool_choice": "required",
             "parallel_tool_calls": False,
+            "chat_template_kwargs": {"enable_thinking": False},
         },
         "tasks": [
             {
@@ -294,6 +295,7 @@ def _metadata() -> dict[str, Any]:
             "seed_version": "run1b-request-v1",
             "tool_choice": "required",
             "parallel_tool_calls": False,
+            "chat_template_kwargs": {"enable_thinking": False},
         },
         "models": [
             {
@@ -577,6 +579,13 @@ def test_underpowered_smoke_preserves_engineering_pass_and_quality_not_evaluable
             "served_model_id",
         ),
         (
+            lambda report: None,
+            lambda metadata: metadata["sampling"]["chat_template_kwargs"].__setitem__(
+                "enable_thinking", True
+            ),
+            "frozen Run 1B sampling contract",
+        ),
+        (
             lambda report: report.__setitem__("backend", "dataset_replay"),
             lambda metadata: None,
             "backend",
@@ -610,6 +619,7 @@ def test_metadata_must_match_raw_execution_contract(
         ("max_tokens", 256),
         ("seed_version", "other-seed-contract"),
         ("seed_derivation", "arbitrary caller supplied seed"),
+        ("chat_template_kwargs", {"enable_thinking": True}),
     ],
 )
 def test_run1b_report_rejects_matching_but_nonfrozen_sampling(

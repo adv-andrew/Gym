@@ -771,6 +771,41 @@ def test_model_spec_pins_top_p_instead_of_inheriting_endpoint_defaults():
 
     assert getattr(spec, "top_p", None) == 0.95
     assert spec.max_tokens == 512
+    assert spec.chat_template_kwargs is None
+
+
+@pytest.mark.parametrize(
+    "chat_template_kwargs",
+    [
+        True,
+        [],
+        {},
+        {"enable_thinking": "false"},
+        {"enable_thinking": False, "unreviewed_option": True},
+    ],
+)
+def test_model_spec_rejects_unsafe_chat_template_kwargs(chat_template_kwargs):
+    with pytest.raises(ValueError, match="chat_template_kwargs"):
+        ModelSpec(
+            label="model",
+            model="model",
+            base_url="http://x",
+            chat_template_kwargs=chat_template_kwargs,
+        )
+
+
+def test_model_spec_copies_valid_chat_template_kwargs_before_use():
+    caller_owned = {"enable_thinking": False}
+    spec = ModelSpec(
+        label="model",
+        model="model",
+        base_url="http://x",
+        chat_template_kwargs=caller_owned,
+    )
+
+    caller_owned["enable_thinking"] = True
+
+    assert spec.chat_template_kwargs == {"enable_thinking": False}
 
 
 @pytest.mark.parametrize("top_p", [float("nan"), 0.0, -0.01, 1.01, True])
@@ -779,7 +814,7 @@ def test_model_spec_rejects_unsafe_top_p(top_p):
         ModelSpec(label="model", model="model", base_url="http://x", top_p=top_p)
 
 
-def test_llm_request_pins_identical_sampling_and_pair_derived_seed_across_models():
+def test_llm_request_pins_identical_sampling_template_kwargs_and_pair_derived_seed_across_models():
     class Response:
         async def __aenter__(self):
             return self
@@ -813,7 +848,12 @@ def test_llm_request_pins_identical_sampling_and_pair_derived_seed_across_models
     row = _profile_task_rows(_load_example_rows(), task_count=8)[7]
     row["_profile_response_index"] = 3
     session = Session()
-    decoding = {"temperature": 0.3, "top_p": 0.85, "max_tokens": 256}
+    decoding = {
+        "temperature": 0.3,
+        "top_p": 0.85,
+        "max_tokens": 256,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
     specs = [
         ModelSpec(label="small", model="small", base_url="http://x", **decoding),
         ModelSpec(label="frontier", model="frontier", base_url="http://x", **decoding),
@@ -824,13 +864,70 @@ def test_llm_request_pins_identical_sampling_and_pair_derived_seed_across_models
         assert action == {"name": "noop", "arguments": {}}
 
     sampling_contracts = [
-        {key: payload[key] for key in ("temperature", "top_p", "max_tokens", "seed")}
+        {
+            key: payload[key]
+            for key in ("temperature", "top_p", "max_tokens", "seed", "chat_template_kwargs")
+        }
         for payload in session.payloads
     ]
     assert sampling_contracts == [
-        {"temperature": 0.3, "top_p": 0.85, "max_tokens": 256, "seed": 756_251_775},
-        {"temperature": 0.3, "top_p": 0.85, "max_tokens": 256, "seed": 756_251_775},
+        {
+            "temperature": 0.3,
+            "top_p": 0.85,
+            "max_tokens": 256,
+            "seed": 756_251_775,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+        {
+            "temperature": 0.3,
+            "top_p": 0.85,
+            "max_tokens": 256,
+            "seed": 756_251_775,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
     ]
+
+
+def test_llm_request_omits_chat_template_kwargs_for_generic_sweep():
+    class Response:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        async def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [{"function": {"name": "noop", "arguments": "{}"}}],
+                            "content": None,
+                        }
+                    }
+                ]
+            }
+
+    class Session:
+        def __init__(self):
+            self.payload = None
+
+        def post(self, url, *, json, headers, timeout):
+            self.payload = json
+            return Response()
+
+    row = _profile_task_rows(_load_example_rows(), task_count=1)[0]
+    row["_profile_response_index"] = 0
+    session = Session()
+    spec = ModelSpec(label="generic", model="generic", base_url="http://x")
+
+    action = asyncio.run(_llm_action(session, spec, row, "- Cell 0: state", step_idx=0))
+
+    assert action == {"name": "noop", "arguments": {}}
+    assert "chat_template_kwargs" not in session.payload
 
 
 def test_sweep_report_binds_credential_free_model_sampling_backend_and_task_contract(monkeypatch):
@@ -863,6 +960,7 @@ def test_sweep_report_binds_credential_free_model_sampling_backend_and_task_cont
             temperature=0.3,
             top_p=0.85,
             max_tokens=256,
+            chat_template_kwargs={"enable_thinking": False},
             capability_rank=1,
         ),
         ModelSpec(
@@ -872,6 +970,7 @@ def test_sweep_report_binds_credential_free_model_sampling_backend_and_task_cont
             temperature=0.3,
             top_p=0.85,
             max_tokens=256,
+            chat_template_kwargs={"enable_thinking": False},
             capability_rank=2,
         ),
     ]
@@ -891,6 +990,7 @@ def test_sweep_report_binds_credential_free_model_sampling_backend_and_task_cont
         "seed_version": "run1b-request-v1",
         "tool_choice": "required",
         "parallel_tool_calls": False,
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     assert report["tasks"][0]["regime_mix"] == {"prb_exhaustion": 1.0}
     assert "never-serialize" not in json.dumps(report)
@@ -1068,6 +1168,31 @@ def test_sweep_rejects_bad_config():
             )
         )
 
+    mismatched_template_kwargs = [
+        ModelSpec(
+            label="small",
+            model="small",
+            base_url="http://x",
+            chat_template_kwargs={"enable_thinking": False},
+            capability_rank=1,
+        ),
+        ModelSpec(
+            label="frontier",
+            model="frontier",
+            base_url="http://x",
+            chat_template_kwargs={"enable_thinking": True},
+            capability_rank=2,
+        ),
+    ]
+    with pytest.raises(ValueError, match="identical sampling and chat-template settings"):
+        asyncio.run(
+            _sweep(
+                _profile_task_rows(_load_example_rows(), 1),
+                repeats=1,
+                specs=mismatched_template_kwargs,
+            )
+        )
+
 
 def test_compliance_profile_rejects_identical_but_nonfrozen_sampling():
     specs = [
@@ -1098,6 +1223,40 @@ def test_compliance_profile_rejects_identical_but_nonfrozen_sampling():
                 repeats=1,
                 specs=specs,
                 compliance_profile=True,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "chat_template_kwargs",
+    [None, {"enable_thinking": True}],
+)
+@pytest.mark.parametrize("profile_kwargs", [{"run1b_profile": True}, {"compliance_profile": True}])
+def test_run1b_profiles_require_thinking_disabled(chat_template_kwargs, profile_kwargs):
+    specs = [
+        ModelSpec(
+            label="small",
+            model="small",
+            base_url="http://127.0.0.1:1/v1",
+            chat_template_kwargs=chat_template_kwargs,
+            capability_rank=1,
+        ),
+        ModelSpec(
+            label="large",
+            model="large",
+            base_url="http://127.0.0.1:1/v1",
+            chat_template_kwargs=chat_template_kwargs,
+            capability_rank=2,
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="enable_thinking"):
+        asyncio.run(
+            _sweep(
+                _profile_task_rows(_load_example_rows(), 1),
+                repeats=1,
+                specs=specs,
+                **profile_kwargs,
             )
         )
 

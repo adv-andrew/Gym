@@ -38,6 +38,7 @@ _RUN1B_SAMPLING = {
     "seed_version": "run1b-request-v1",
     "tool_choice": "required",
     "parallel_tool_calls": False,
+    "chat_template_kwargs": {"enable_thinking": False},
 }
 _ANCHOR_ORDER = (
     "anchor:relief",
@@ -66,6 +67,7 @@ _SAMPLING_FIELDS = {
     "seed_version",
     "tool_choice",
     "parallel_tool_calls",
+    "chat_template_kwargs",
 }
 _HASH_FIELDS = {
     "task_manifest_sha256",
@@ -275,12 +277,24 @@ def _validate_sampling(value: Any, path: str) -> dict[str, Any]:
         raise ValueError(f"{path}.tool_choice must be 'required'")
     if sampling["parallel_tool_calls"] is not False:
         raise ValueError(f"{path}.parallel_tool_calls must be false")
+    template_kwargs = _require_keys(
+        sampling["chat_template_kwargs"],
+        required={"enable_thinking"},
+        allowed={"enable_thinking"},
+        path=f"{path}.chat_template_kwargs",
+    )
+    if not isinstance(template_kwargs["enable_thinking"], bool):
+        raise ValueError(f"{path}.chat_template_kwargs.enable_thinking must be boolean")
     observed = {field: sampling[field] for field in _RUN1B_SAMPLING}
     if observed != _RUN1B_SAMPLING:
         raise ValueError(
             f"{path} must equal the frozen Run 1B sampling contract {_RUN1B_SAMPLING}, got {observed}"
         )
-    return dict(sampling)
+    normalized = dict(sampling)
+    normalized["chat_template_kwargs"] = {
+        "enable_thinking": template_kwargs["enable_thinking"]
+    }
+    return normalized
 
 
 def _sanitize_run_log(value: Any) -> str:

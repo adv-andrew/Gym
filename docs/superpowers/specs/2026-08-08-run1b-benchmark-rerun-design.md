@@ -35,6 +35,12 @@ available.
 - Models receive identical messages, tool schemas, horizon, temperature,
   top-p, maximum output tokens, required single-tool-call policy, and
   pair-derived request seeds.
+- Every named profile sends `chat_template_kwargs={"enable_thinking": false}`
+  natively to both Qwen3 endpoints. Generic sweeps may omit this field, but a
+  Run 1B engineering smoke, benchmark smoke, or compliance run may not. The
+  H100 tool-path smoke showed that thinking can exhaust the 512-token
+  tool-only budget before a native call, so omission is not equivalent to the
+  frozen contract.
 - vLLM is launched with its framework defaults instead of mutable model
   `generation_config.json` overrides; engine and parser settings are recorded.
 - Scripted anchors and learned models use the same prompt/repeat support.
@@ -45,11 +51,13 @@ The launch sequence is fail-closed:
 
 1. Local CPU tests pass on the exact source to transfer.
 2. Model servers report the expected model IDs and revisions.
-3. A one-prompt/two-response tool-call smoke completes for both models with no
+3. Request capture confirms identical sampling, seed derivation, and explicit
+   `enable_thinking=false` chat-template kwargs for both models.
+4. A one-prompt/two-response tool-call smoke completes for both models with no
    infrastructure, parse, or invalid-call failures.
-4. A five-prompt/two-response benchmark smoke passes every scripted anchor
+5. A five-prompt/two-response benchmark smoke passes every scripted anchor
    constraint and both model engineering gates.
-5. Only then may the 500 by 16 profile run.
+6. Only then may the 500 by 16 profile run.
 
 The full engineering gate requires the complete planned pair support for every
 model and zero infrastructure errors, parse failures, and invalid calls. A

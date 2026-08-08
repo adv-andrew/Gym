@@ -349,8 +349,17 @@ The frozen decoding contract is identical for every learned model:
 
 - temperature `0.2`, top-p `0.95`, and exactly `512` maximum output tokens;
 - exactly one tool call and no parallel tool calls; and
+- chat-template kwargs exactly `{"enable_thinking": false}`; and
 - a deterministic request seed derived from prompt index, response index, and
   environment step.
+
+The explicit thinking switch is part of the request, not merely a server
+default. In the H100 tool-path smoke, Qwen3's thinking mode could consume the
+entire 512-token tool-only budget before emitting a native call. Disabling it
+keeps this benchmark focused on state-to-tool capability and makes the two
+model requests comparable. Generic exploratory sweeps may omit
+`chat_template_kwargs`; all three named Run 1B profiles fail closed unless
+every model declares exactly `{"enable_thinking": false}`.
 
 For locally served Qwen3 checkpoints, start vLLM from an immutable
 linux/amd64 image digest and record that digest in the receipt. Do not use a
@@ -384,7 +393,7 @@ python resources_servers/openair_congestion/model_sweep.py \
 ```
 
 This flag freezes the shape to one prompt by two response-indexed rollouts and
-freezes sampling to `0.2 / 0.95 / 512`. It succeeds only when both models have
+freezes sampling to `0.2 / 0.95 / 512` with Qwen3 thinking disabled. It succeeds only when both models have
 complete support with zero infrastructure, native-tool parsing, and invalid
 call failures. The raw JSON is the retained gate receipt. Content-only JSON is
 not accepted as a tool call, so a broken vLLM tool parser cannot qualify. This
@@ -429,7 +438,7 @@ python resources_servers/openair_congestion/model_sweep.py \
 ```
 
 `--benchmark-smoke` freezes both the `5 x 2` shape and the full Run 1B
-sampling/seed/tool-choice contract. At that size, zero infrastructure, parse,
+sampling/seed/tool-choice/chat-template contract. At that size, zero infrastructure, parse,
 and invalid-call failures plus the scripted anchor checks are engineering
 gates. Model-quality inference is deliberately `NOT_EVALUABLE`, because each
 regime has only one prompt cluster. Do not describe a smoke as a model-ordering
@@ -476,7 +485,7 @@ sha256sum -c /absolute/path/run1b_<UTC>_<shortcommit>/SHA256SUMS
 ```
 
 The credential-free metadata object must bind the run ID, exact clean source
-commit, causal `replay` backend, raw sampling contract, served and repository
+commit, causal `replay` backend, raw sampling and chat-template contract, served and repository
 model identities/revisions, model and tokenizer hashes when available, task,
 tool, reward, dynamics, and renderer SHA-256 values, host/GPU/runtime identity,
 container image digest and signature status, exact commands and exit codes,
