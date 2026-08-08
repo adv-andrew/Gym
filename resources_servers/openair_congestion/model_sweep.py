@@ -28,7 +28,8 @@ Anchors need no model server or API key; the sweep runs fully offline on the
 replay backend. LLM policies are described in a JSON file (see --models):
 
     [{"label": "frontier", "model": "<frontier-model>", "base_url": "https://api.example/v1",
-      "api_key_env": "FRONTIER_API_KEY", "temperature": 0.2, "capability_rank": 2}]
+      "api_key_env": "FRONTIER_API_KEY", "temperature": 0.2, "top_p": 0.95,
+      "max_tokens": 512, "capability_rank": 2}]
 
 Each model receives every task row's own messages (system prompt + task
 prompt), the current rendered observation as the latest user message, and the
@@ -53,6 +54,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import functools
+import hashlib
 import json
 import math
 import os
@@ -62,7 +64,7 @@ import statistics
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Mapping
 
 import aiohttp
 import numpy as np
@@ -83,6 +85,18 @@ from resources_servers.openair_congestion.client import (
 
 _EXAMPLE_JSONL = Path(__file__).parent / "data" / "example.jsonl"
 _SCHEDULERS = ("PF", "RR", "MaxCI")
+_BOOTSTRAP_METHOD = "regime_stratified_prompt_cluster_percentile"
+_DEFAULT_BOOTSTRAP_DRAWS = 10_000
+_COMPLIANCE_BOOTSTRAP_DRAWS = 50_000
+_RUN1B_TEMPERATURE = 0.2
+_RUN1B_TOP_P = 0.95
+_RUN1B_MAX_TOKENS = 512
+_MAX_MODEL_OUTPUT_TOKENS = 512
+_PAIR_KEY = re.compile(r"^(0|[1-9][0-9]*):(0|[1-9][0-9]*)$")
+_REQUEST_SEED_VERSION = "run1b-request-v1"
+_REQUEST_SEED_DERIVATION = (
+    "sha256(run1b-request-v1:{prompt_index}:{response_index}:{step_index}) mod 2**31"
+)
 
 
 def _load_example_rows(path: Path = _EXAMPLE_JSONL) -> list[dict[str, Any]]:
@@ -291,27 +305,77 @@ class ModelSpec:
     base_url: str
     api_key_env: str = ""
     temperature: float = 0.2
+    top_p: float = 0.95
     max_tokens: int = 512
     # Increasing integers encode the expected capability order. When two or
     # more models are configured, every model must have a unique rank.
     capability_rank: int | None = None
 
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.temperature, bool)
+            or not isinstance(self.temperature, (int, float))
+            or not math.isfinite(float(self.temperature))
+            or not 0.0 <= float(self.temperature) <= 2.0
+        ):
+            raise ValueError(f"temperature must be a finite number between 0 and 2, got {self.temperature!r}")
+        if (
+            isinstance(self.top_p, bool)
+            or not isinstance(self.top_p, (int, float))
+            or not math.isfinite(float(self.top_p))
+            or not 0.0 < float(self.top_p) <= 1.0
+        ):
+            raise ValueError(f"top_p must be a finite number greater than 0 and at most 1, got {self.top_p!r}")
+        if (
+            isinstance(self.max_tokens, bool)
+            or not isinstance(self.max_tokens, int)
+            or not 1 <= self.max_tokens <= _MAX_MODEL_OUTPUT_TOKENS
+        ):
+            raise ValueError(
+                f"max_tokens must be an integer between 1 and {_MAX_MODEL_OUTPUT_TOKENS}, "
+                f"got {self.max_tokens!r}"
+            )
+        if self.capability_rank is not None and (
+            isinstance(self.capability_rank, bool)
+            or not isinstance(self.capability_rank, int)
+            or self.capability_rank < 1
+        ):
+            raise ValueError(
+                f"capability_rank must be a positive integer when provided, got {self.capability_rank!r}"
+            )
 
-def _require_compliance_models(specs: list[ModelSpec]) -> None:
-    """Prevent the named compliance profile from passing on anchors alone."""
+
+def _require_ranked_models(specs: list[ModelSpec], profile_name: str) -> None:
+    """Prevent a named real-model profile from passing on anchors alone."""
 
     if len(specs) < 2:
-        raise ValueError("--compliance-profile requires at least two real models")
+        raise ValueError(f"{profile_name} requires at least two real models")
     if any(not spec.label.strip() or not spec.model.strip() or not spec.base_url.strip() for spec in specs):
-        raise ValueError("--compliance-profile requires non-empty label, model, and base_url values")
+        raise ValueError(f"{profile_name} requires non-empty label, model, and base_url values")
     identities = [spec.model.strip() for spec in specs]
     if len(identities) != len(set(identities)):
-        raise ValueError("--compliance-profile requires distinct model identities")
+        raise ValueError(f"{profile_name} requires distinct model identities")
     if any(spec.capability_rank is None for spec in specs):
-        raise ValueError("--compliance-profile requires capability_rank for every model")
+        raise ValueError(f"{profile_name} requires capability_rank for every model")
     ranks = [int(spec.capability_rank) for spec in specs if spec.capability_rank is not None]
     if len(ranks) != len(set(ranks)):
-        raise ValueError("--compliance-profile requires unique capability_rank values")
+        raise ValueError(f"{profile_name} requires unique capability_rank values")
+
+
+def _require_compliance_models(specs: list[ModelSpec]) -> None:
+    _require_ranked_models(specs, "--compliance-profile")
+
+
+def _require_run1b_sampling(specs: list[ModelSpec]) -> None:
+    expected = (_RUN1B_TEMPERATURE, _RUN1B_TOP_P, _RUN1B_MAX_TOKENS)
+    for spec in specs:
+        observed = (float(spec.temperature), float(spec.top_p), spec.max_tokens)
+        if observed != expected:
+            raise ValueError(
+                "Run 1B requires the frozen sampling contract "
+                f"temperature={expected[0]}, top_p={expected[1]}, max_tokens={expected[2]}; "
+                f"model {spec.label!r} declared {observed}"
+            )
 
 
 def _quantile(values: list[float], probability: float) -> float | None:
@@ -342,35 +406,198 @@ def _correlation(xs: list[float], ys: list[float]) -> float | None:
     return sum(x * y for x, y in zip(dx, dy, strict=True)) / denominator
 
 
-def _paired_bootstrap_ci(
-    deltas: list[float],
-    *,
-    seed: int = 0,
-    draws: int = 10_000,
-) -> tuple[float, float]:
-    """Deterministic percentile bootstrap interval for paired mean deltas."""
+def _nonnegative_int(value: Any, path: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{path} must be a non-negative integer")
+    return value
 
-    if not deltas:
+
+def _parse_pair_key(pair_key: Any, path: str) -> tuple[int, int, str]:
+    if not isinstance(pair_key, str) or not _PAIR_KEY.fullmatch(pair_key):
+        raise ValueError(f"{path}.pair_key must be '<prompt_index>:<response_index>'")
+    prompt_text, response_text = pair_key.split(":", 1)
+    return int(prompt_text), int(response_text), pair_key
+
+
+def _record_pair_coordinates(record: Mapping[str, Any], path: str = "episode record") -> tuple[int, int, str]:
+    """Return validated prompt, response, and regime identities for one episode."""
+
+    prompt_index, response_index, pair_key = _parse_pair_key(record.get("pair_key"), path)
+    explicit_prompt_index = _nonnegative_int(record.get("prompt_index"), f"{path}.prompt_index")
+    explicit_response_index = _nonnegative_int(record.get("response_index"), f"{path}.response_index")
+    if explicit_prompt_index != prompt_index or explicit_response_index != response_index:
+        raise ValueError(f"{path} prompt/response indexes disagree with pair_key {pair_key!r}")
+    scenario_id = record.get("scenario_id")
+    if not isinstance(scenario_id, str) or not scenario_id:
+        raise ValueError(f"{path}.scenario_id must be a non-empty string")
+    return prompt_index, response_index, scenario_id
+
+
+def _validate_pair_manifest(expected_pair_manifest: Mapping[str, str], *, expected_episodes: int) -> None:
+    if not isinstance(expected_pair_manifest, Mapping) or len(expected_pair_manifest) != expected_episodes:
+        raise ValueError("expected_pair_manifest size must equal expected_episodes")
+    coordinates: set[tuple[int, int]] = set()
+    scenarios_by_prompt: dict[int, set[str]] = {}
+    for pair_key, scenario_id in expected_pair_manifest.items():
+        prompt_index, response_index, _ = _parse_pair_key(pair_key, "expected_pair_manifest")
+        if not isinstance(scenario_id, str) or not scenario_id:
+            raise ValueError(f"expected_pair_manifest[{pair_key!r}] must name a non-empty scenario")
+        coordinates.add((prompt_index, response_index))
+        scenarios_by_prompt.setdefault(prompt_index, set()).add(scenario_id)
+    if any(len(scenarios) != 1 for scenarios in scenarios_by_prompt.values()):
+        raise ValueError("each prompt in expected_pair_manifest must map to exactly one scenario")
+    prompt_count = max(scenarios_by_prompt, default=-1) + 1
+    response_count = max((response for _prompt, response in coordinates), default=-1) + 1
+    expected_coordinates = {
+        (prompt_index, response_index)
+        for prompt_index in range(prompt_count)
+        for response_index in range(response_count)
+    }
+    if coordinates != expected_coordinates:
+        raise ValueError("expected_pair_manifest must describe contiguous Cartesian prompt/repeat support")
+
+
+def _validated_episode_records(
+    row: Mapping[str, Any],
+    *,
+    label: str,
+    expected_pair_manifest: Mapping[str, str],
+    require_complete_support: bool,
+) -> dict[str, dict[str, Any]]:
+    """Validate one policy row before any engineering or quality gate uses it."""
+
+    episodes = _nonnegative_int(row.get("episodes"), f"{label}.episodes")
+    infra_errors = _nonnegative_int(row.get("infra_errors"), f"{label}.infra_errors")
+    records = row.get("episode_records")
+    if not isinstance(records, list) or len(records) != episodes:
+        raise ValueError(f"{label}.episode_records must contain exactly {episodes} records")
+
+    indexed: dict[str, dict[str, Any]] = {}
+    coordinates: set[tuple[int, int]] = set()
+    parse_failures = invalid_calls = usable_episodes = 0
+    for record_index, record in enumerate(records):
+        path = f"{label}.episode_records[{record_index}]"
+        if not isinstance(record, dict):
+            raise ValueError(f"{path} must be an object")
+        prompt_index, response_index, scenario_id = _record_pair_coordinates(record, path)
+        pair_key = str(record["pair_key"])
+        coordinate = (prompt_index, response_index)
+        if pair_key in indexed or coordinate in coordinates:
+            raise ValueError(f"{label} has duplicate prompt/response coordinates at {pair_key!r}")
+        if pair_key not in expected_pair_manifest:
+            raise ValueError(f"{path}.pair_key is outside planned prompt/repeat support")
+        if scenario_id != expected_pair_manifest[pair_key]:
+            raise ValueError(f"{path}.scenario_id disagrees with the task manifest")
+
+        episode_return = record.get("return")
+        if (
+            isinstance(episode_return, bool)
+            or not isinstance(episode_return, (int, float))
+            or not math.isfinite(float(episode_return))
+        ):
+            raise ValueError(f"{path}.return must be a finite number")
+        record_parse = _nonnegative_int(record.get("parse_failures"), f"{path}.parse_failures")
+        record_invalid = _nonnegative_int(record.get("invalid_calls"), f"{path}.invalid_calls")
+        usable = record.get("usable")
+        if not isinstance(usable, bool) or usable != (record_parse == 0 and record_invalid == 0):
+            raise ValueError(f"{path}.usable disagrees with parse/invalid failures")
+
+        parse_failures += record_parse
+        invalid_calls += record_invalid
+        usable_episodes += int(usable)
+        indexed[pair_key] = record
+        coordinates.add(coordinate)
+
+    expected_keys = set(expected_pair_manifest)
+    observed_keys = set(indexed)
+    if not observed_keys <= expected_keys:
+        raise ValueError(f"{label}.episode_records contain pair keys outside planned support")
+    if require_complete_support and observed_keys != expected_keys:
+        raise ValueError(f"{label}.episode_records do not cover the exact planned prompt/repeat support")
+    if len(expected_keys - observed_keys) != infra_errors:
+        raise ValueError(f"{label}.infra_errors disagree with missing planned prompt/repeat records")
+    if parse_failures != _nonnegative_int(row.get("parse_failures"), f"{label}.parse_failures"):
+        raise ValueError(f"{label}.parse_failures disagree with episode records")
+    if invalid_calls != _nonnegative_int(row.get("invalid_calls"), f"{label}.invalid_calls"):
+        raise ValueError(f"{label}.invalid_calls disagree with episode records")
+    if usable_episodes != _nonnegative_int(row.get("usable_episodes"), f"{label}.usable_episodes"):
+        raise ValueError(f"{label}.usable_episodes disagree with episode records")
+    mean_return = row.get("mean_return")
+    if records:
+        if (
+            isinstance(mean_return, bool)
+            or not isinstance(mean_return, (int, float))
+            or not math.isfinite(float(mean_return))
+        ):
+            raise ValueError(f"{label}.mean_return must be a finite number when episodes are present")
+        record_mean = statistics.fmean(float(record["return"]) for record in records)
+        # PolicyStats.row serializes this aggregate to four decimal places;
+        # accept either the raw mean or that representation, but not a row
+        # that contradicts its episode records.
+        if not math.isclose(float(mean_return), record_mean, rel_tol=0.0, abs_tol=0.000_050_000_001):
+            raise ValueError(f"{label}.mean_return disagrees with episode records")
+    elif mean_return is not None:
+        raise ValueError(f"{label}.mean_return must be null when no episodes are present")
+    return indexed
+
+
+def _clustered_paired_summary(
+    paired_deltas: list[tuple[int, str, float]],
+    *,
+    seed: int,
+    draws: int,
+) -> dict[str, Any]:
+    """Summarize paired deltas using regime-stratified prompt clusters."""
+
+    if not paired_deltas:
         raise ValueError("at least one paired delta is required")
     if draws < 1:
         raise ValueError("draws must be positive")
-    values = np.asarray(deltas, dtype=float)
-    if not np.all(np.isfinite(values)):
-        raise ValueError("paired deltas must be finite")
+
+    clusters: dict[tuple[str, int], list[float]] = {}
+    for prompt_index, scenario_id, delta in paired_deltas:
+        value = float(delta)
+        if not math.isfinite(value):
+            raise ValueError("paired deltas must be finite")
+        clusters.setdefault((scenario_id, prompt_index), []).append(value)
+
+    cluster_means = {
+        key: statistics.fmean(values)
+        for key, values in clusters.items()
+    }
+    strata: dict[str, list[float]] = {}
+    for (scenario_id, _prompt_index), value in sorted(cluster_means.items()):
+        strata.setdefault(scenario_id, []).append(value)
+
     rng = np.random.default_rng(seed)
-    means = np.empty(draws, dtype=float)
-    # Keep peak index memory bounded for the 8,000-episode compliance gate.
-    chunk_size = max(1, min(256, 2_000_000 // len(values)))
+    bootstrap_means = np.empty(draws, dtype=float)
+    prompt_count = len(cluster_means)
+    chunk_size = max(1, min(256, 2_000_000 // prompt_count))
     for start in range(0, draws, chunk_size):
         count = min(chunk_size, draws - start)
-        indices = rng.integers(
-            0,
-            len(values),
-            size=(count, len(values)),
-        )
-        means[start : start + count] = values[indices].mean(axis=1)
-    low, high = np.quantile(means, [0.025, 0.975])
-    return float(low), float(high)
+        sampled_sum = np.zeros(count, dtype=float)
+        for scenario_id in sorted(strata):
+            values = np.asarray(strata[scenario_id], dtype=float)
+            indices = rng.integers(0, len(values), size=(count, len(values)))
+            sampled_sum += values[indices].sum(axis=1)
+        bootstrap_means[start : start + count] = sampled_sum / prompt_count
+
+    ordered_cluster_means = list(cluster_means.values())
+    low, high = np.quantile(bootstrap_means, [0.025, 0.975])
+    return {
+        "bootstrap_method": _BOOTSTRAP_METHOD,
+        "bootstrap_seed": seed,
+        "bootstrap_draws": draws,
+        "prompt_clusters": prompt_count,
+        "response_pairs": len(paired_deltas),
+        "mean_delta": statistics.fmean(ordered_cluster_means),
+        "median_delta": statistics.median(ordered_cluster_means),
+        "ci95_low": float(low),
+        "ci95_high": float(high),
+        "prompt_wins": sum(value > 0.0 for value in ordered_cluster_means),
+        "prompt_ties": sum(value == 0.0 for value in ordered_cluster_means),
+        "prompt_losses": sum(value < 0.0 for value in ordered_cluster_means),
+    }
 
 
 @dataclass
@@ -408,11 +635,14 @@ class PolicyStats:
         invalid_calls: int,
     ) -> None:
         usable = parse_failures == 0 and invalid_calls == 0
+        prompt_index, response_index, _ = _parse_pair_key(pair_key, "episode")
         self.returns.append(episode_return)
         self.episode_records.append(
             {
                 "return": episode_return,
                 "pair_key": pair_key,
+                "prompt_index": prompt_index,
+                "response_index": response_index,
                 "usable": usable,
                 "parse_failures": parse_failures,
                 "invalid_calls": invalid_calls,
@@ -527,17 +757,21 @@ def _parse_tool_call(message: dict) -> dict[str, Any] | None:
         if not isinstance(fn.get("name"), str) or not isinstance(arguments, dict):
             return None
         return {"name": fn["name"], "arguments": arguments}
-    # Fallback: a bare JSON object {"name": ..., "arguments": {...}} in content.
-    content = message.get("content") or ""
-    start, end = content.find("{"), content.rfind("}")
-    if 0 <= start < end:
-        try:
-            obj = _strict_json_object(content[start : end + 1])
-        except (TypeError, ValueError):
-            return None
-        if isinstance(obj, dict) and isinstance(obj.get("name"), str) and isinstance(obj.get("arguments", {}), dict):
-            return {"name": obj["name"], "arguments": obj.get("arguments") or {}}
+    # Gated profiles qualify the native endpoint/parser path, not a model that
+    # merely prints JSON-looking prose.  Content-only output is therefore a
+    # parse failure even when it contains an action-shaped object.
     return None
+
+
+def _request_seed(row: dict[str, Any], step_idx: int) -> int:
+    """Derive a provider-safe seed from the paired request coordinates."""
+
+    prompt_index = int(row["_profile_prompt_index"])
+    response_index = int(row["_profile_response_index"])
+    if prompt_index < 0 or response_index < 0 or step_idx < 0:
+        raise ValueError("prompt, response, and step indices must be non-negative")
+    material = f"{_REQUEST_SEED_VERSION}:{prompt_index}:{response_index}:{step_idx}".encode()
+    return int.from_bytes(hashlib.sha256(material).digest()[:8], "big") % (2**31)
 
 
 async def _llm_action(
@@ -567,7 +801,9 @@ async def _llm_action(
         "tool_choice": "required",
         "parallel_tool_calls": False,
         "temperature": spec.temperature,
+        "top_p": spec.top_p,
         "max_tokens": spec.max_tokens,
+        "seed": _request_seed(row, step_idx),
     }
     async with session.post(
         f"{spec.base_url.rstrip('/')}/chat/completions",
@@ -715,6 +951,7 @@ def _evaluate_model_ordering(
     specs: list[ModelSpec],
     *,
     expected_episodes: int,
+    expected_pair_manifest: Mapping[str, str],
     compliance: bool = False,
     failure_rate_ceiling: float = 0.0,
 ) -> dict[str, Any]:
@@ -723,6 +960,7 @@ def _evaluate_model_ordering(
     if not math.isfinite(failure_rate_ceiling) or not 0.0 <= failure_rate_ceiling <= 1.0:
         raise ValueError(f"failure_rate_ceiling must be a finite number between 0 and 1, got {failure_rate_ceiling!r}")
     effective_failure_ceiling = 0.0 if compliance else failure_rate_ceiling
+    _validate_pair_manifest(expected_pair_manifest, expected_episodes=expected_episodes)
 
     if len(specs) < 2:
         return {"status": "NOT_CONFIGURED", "expected": [], "observed": {}, "reason": "fewer than two models"}
@@ -741,6 +979,23 @@ def _evaluate_model_ordering(
         return {"status": "NOT_EVALUABLE", "expected": expected, "observed": {}, "reason": "missing model row"}
 
     observed = {label: by_policy[label]["mean_return"] for label in expected}
+    all_records_by_label: dict[str, dict[str, dict[str, Any]]] = {}
+    for label in expected:
+        try:
+            all_records_by_label[label] = _validated_episode_records(
+                by_policy[label],
+                label=label,
+                expected_pair_manifest=expected_pair_manifest,
+                require_complete_support=compliance,
+            )
+        except ValueError as error:
+            return {
+                "status": "NOT_EVALUABLE",
+                "expected": expected,
+                "observed": observed,
+                "reason": str(error),
+            }
+
     complete = all(
         by_policy[label]["episodes"] + by_policy[label]["infra_errors"] == expected_episodes
         and by_policy[label]["mean_return"] is not None
@@ -756,9 +1011,9 @@ def _evaluate_model_ordering(
 
     failure_counts = {
         label: {
-            "parse_failures": int(by_policy[label].get("parse_failures", 0)),
-            "invalid_calls": int(by_policy[label].get("invalid_calls", 0)),
-            "infra_errors": int(by_policy[label].get("infra_errors", 0)),
+            "parse_failures": by_policy[label]["parse_failures"],
+            "invalid_calls": by_policy[label]["invalid_calls"],
+            "infra_errors": by_policy[label]["infra_errors"],
         }
         for label in expected
     }
@@ -780,26 +1035,17 @@ def _evaluate_model_ordering(
             ),
         }
 
+    paired_records: dict[str, dict[str, dict[str, Any]]] = {}
     paired_returns: dict[str, dict[str, float]] = {}
     for label in expected:
-        records = by_policy[label].get("episode_records") or []
-        if len(records) != by_policy[label]["episodes"]:
-            return {
-                "status": "NOT_EVALUABLE",
-                "expected": expected,
-                "observed": observed,
-                "reason": f"{label} lacks complete paired episode records",
-            }
-        all_keys = [str(record.get("pair_key")) for record in records]
-        if len(set(all_keys)) != len(all_keys) or "None" in all_keys:
-            return {
-                "status": "NOT_EVALUABLE",
-                "expected": expected,
-                "observed": observed,
-                "reason": f"{label} has missing or duplicate pair keys",
-            }
+        paired_records[label] = {
+            pair_key: record
+            for pair_key, record in all_records_by_label[label].items()
+            if record["usable"] is True
+        }
         paired_returns[label] = {
-            str(record["pair_key"]): float(record["return"]) for record in records if record.get("usable", False)
+            pair_key: float(record["return"])
+            for pair_key, record in paired_records[label].items()
         }
 
     reference_keys = set.intersection(*(set(paired_returns[label]) for label in expected))
@@ -823,10 +1069,16 @@ def _evaluate_model_ordering(
             "failure_rate_ceiling": effective_failure_ceiling,
             "reason": "compliance mode requires every prompt/repeat pair to be usable",
         }
-    for label in expected:
-        unusable_count = by_policy[label]["episodes"] - len(paired_returns[label])
-        reported_failures = failure_counts[label]["parse_failures"] + failure_counts[label]["invalid_calls"]
-        if unusable_count != reported_failures:
+    comparisons: list[dict[str, Any]] = []
+    passed = True
+    sorted_keys = sorted(reference_keys)
+    pair_coordinates: dict[str, tuple[int, int, str]] = {}
+    for pair_key in sorted_keys:
+        coordinates = {
+            _record_pair_coordinates(paired_records[label][pair_key])
+            for label in expected
+        }
+        if len(coordinates) != 1:
             return {
                 "status": "NOT_EVALUABLE",
                 "expected": expected,
@@ -834,36 +1086,70 @@ def _evaluate_model_ordering(
                 "failure_counts": failure_counts,
                 "failure_rates": failure_rates,
                 "failure_rate_ceiling": effective_failure_ceiling,
-                "reason": (f"{label} usable flags disagree with its parse/invalid failure counts"),
+                "reason": f"model profiles disagree on prompt, response, or regime identity for pair {pair_key!r}",
             }
+        pair_coordinates[pair_key] = coordinates.pop()
 
-    comparisons: list[dict[str, Any]] = []
-    passed = True
-    sorted_keys = sorted(reference_keys)
+    prompt_clusters_by_scenario: dict[str, set[int]] = {
+        scenario_id: set() for scenario_id in set(expected_pair_manifest.values())
+    }
+    for prompt_index, _response_index, scenario_id in pair_coordinates.values():
+        prompt_clusters_by_scenario.setdefault(scenario_id, set()).add(prompt_index)
+    underpowered_scenarios = sorted(
+        scenario_id
+        for scenario_id, prompt_indices in prompt_clusters_by_scenario.items()
+        if len(prompt_indices) < 2
+    )
+    if underpowered_scenarios:
+        return {
+            "status": "NOT_EVALUABLE",
+            "engineering_status": "PASS",
+            "quality_status": "NOT_EVALUABLE",
+            "expected": expected,
+            "observed": observed,
+            "failure_counts": failure_counts,
+            "failure_rates": failure_rates,
+            "failure_rate_ceiling": effective_failure_ceiling,
+            "valid_paired_episodes": len(reference_keys),
+            "comparisons": [],
+            "reason": (
+                "model-quality inference requires at least two prompt clusters per scenario; "
+                f"underpowered scenarios: {underpowered_scenarios}"
+            ),
+        }
+
+    bootstrap_draws = _COMPLIANCE_BOOTSTRAP_DRAWS if compliance else _DEFAULT_BOOTSTRAP_DRAWS
     for comparison_index, (weaker, stronger) in enumerate(zip(expected, expected[1:], strict=False)):
-        deltas = [paired_returns[stronger][key] - paired_returns[weaker][key] for key in sorted_keys]
-        mean_delta = statistics.fmean(deltas)
-        ci95_low, ci95_high = _paired_bootstrap_ci(
-            deltas,
+        paired_deltas = [
+            (
+                pair_coordinates[key][0],
+                pair_coordinates[key][2],
+                paired_returns[stronger][key] - paired_returns[weaker][key],
+            )
+            for key in sorted_keys
+        ]
+        summary = _clustered_paired_summary(
+            paired_deltas,
             seed=comparison_index,
+            draws=bootstrap_draws,
         )
-        comparison_passed = mean_delta > 0.0 and ci95_low > 0.0
+        comparison_passed = summary["mean_delta"] > 0.0 and summary["ci95_low"] > 0.0
         passed = passed and comparison_passed
         comparisons.append(
             {
                 "weaker": weaker,
                 "stronger": stronger,
-                "pairs": len(deltas),
-                "mean_delta": round(mean_delta, 6),
-                "ci95_low": round(ci95_low, 6),
-                "ci95_high": round(ci95_high, 6),
-                "paired_episodes": len(deltas),
+                "pairs": summary["response_pairs"],
+                "paired_episodes": summary["response_pairs"],
+                **summary,
                 "status": "PASS" if comparison_passed else "FAIL",
             }
         )
 
     return {
         "status": "PASS" if passed else "FAIL",
+        "engineering_status": "PASS",
+        "quality_status": "PASS" if passed else "FAIL",
         "expected": expected,
         "observed": observed,
         "failure_counts": failure_counts,
@@ -884,6 +1170,7 @@ async def _sweep(
     concurrency: int = 8,
     *,
     compliance_profile: bool = False,
+    run1b_profile: bool = False,
     failure_rate_ceiling: float = 0.0,
 ) -> dict[str, Any]:
     if repeats < 1:
@@ -896,6 +1183,8 @@ async def _sweep(
         raise ValueError(f"failure_rate_ceiling must be a finite number between 0 and 1, got {failure_rate_ceiling!r}")
     if compliance_profile and failure_rate_ceiling != 0.0:
         raise ValueError("compliance profiles require failure_rate_ceiling=0")
+    if compliance_profile:
+        run1b_profile = True
     labels = [spec.label for spec in specs]
     if len(labels) != len(set(labels)):
         raise ValueError(
@@ -909,7 +1198,21 @@ async def _sweep(
         raise ValueError("every model must declare capability_rank when sweeping two or more models")
     if len(ranks) != len(set(ranks)):
         raise ValueError("model capability_rank values must be unique")
+    sampling_contracts = {
+        (float(spec.temperature), float(spec.top_p), spec.max_tokens)
+        for spec in specs
+    }
+    if len(sampling_contracts) > 1:
+        raise ValueError("all models must use identical sampling parameters: temperature, top_p, and max_tokens")
+    if run1b_profile:
+        _require_run1b_sampling(specs)
 
+    expected_pair_manifest = {
+        f"{prompt_index}:{response_index}": str(task_row.get("scenario_id") or "")
+        for prompt_index, task_row in enumerate(task_rows)
+        for response_index in range(repeats)
+    }
+    _validate_pair_manifest(expected_pair_manifest, expected_episodes=len(task_rows) * repeats)
     base_url = _start_local_server()
     rows = _repeat_task_rows(task_rows, repeats)
     results: dict[str, PolicyStats] = {}
@@ -952,46 +1255,89 @@ async def _sweep(
     table.sort(key=lambda r: r["mean_return"] if r["mean_return"] is not None else -math.inf, reverse=True)
 
     anchor_rows = {label: results[label].row(label) for label in _ANCHOR_ORDER}
-    anchor_returns = {
-        label: {str(record["pair_key"]): float(record["return"]) for record in row["episode_records"]}
-        for label, row in anchor_rows.items()
-    }
-    anchor_comparisons: list[dict[str, Any]] = []
-    for comparison_index, (better, worse) in enumerate(_ANCHOR_CONSTRAINTS):
-        pair_keys = sorted(set(anchor_returns[better]) & set(anchor_returns[worse]))
-        deltas = [anchor_returns[better][key] - anchor_returns[worse][key] for key in pair_keys]
-        mean_delta = statistics.fmean(deltas)
-        ci95_low, ci95_high = _paired_bootstrap_ci(
-            deltas,
-            seed=10_000 + comparison_index,
+    anchor_records = {}
+    for label, row in anchor_rows.items():
+        anchor_records[label] = _validated_episode_records(
+            row,
+            label=label,
+            expected_pair_manifest=expected_pair_manifest,
+            require_complete_support=True,
         )
-        passed = mean_delta > 0.0 and ci95_low > 0.0
+    anchor_engineering_ok = all(
+        row["infra_errors"] == 0
+        and row["parse_failures"] == 0
+        and row["invalid_calls"] == 0
+        and row["usable_episodes"] == len(rows)
+        for row in anchor_rows.values()
+    )
+    anchor_comparisons: list[dict[str, Any]] = []
+    bootstrap_draws = _COMPLIANCE_BOOTSTRAP_DRAWS if compliance_profile else _DEFAULT_BOOTSTRAP_DRAWS
+    for comparison_index, (better, worse) in enumerate(_ANCHOR_CONSTRAINTS):
+        pair_keys = sorted(set(anchor_records[better]) & set(anchor_records[worse]))
+        paired_deltas = [
+            (
+                _record_pair_coordinates(anchor_records[better][key])[0],
+                _record_pair_coordinates(anchor_records[better][key])[2],
+                float(anchor_records[better][key]["return"]) - float(anchor_records[worse][key]["return"]),
+            )
+            for key in pair_keys
+        ]
+        summary = _clustered_paired_summary(
+            paired_deltas,
+            seed=10_000 + comparison_index,
+            draws=bootstrap_draws,
+        )
+        passed = summary["mean_delta"] > 0.0 and summary["ci95_low"] > 0.0
         anchor_comparisons.append(
             {
                 "better": better,
                 "worse": worse,
-                "pairs": len(deltas),
-                "mean_delta": round(mean_delta, 6),
-                "ci95_low": round(ci95_low, 6),
-                "ci95_high": round(ci95_high, 6),
+                "pairs": summary["response_pairs"],
+                "paired_episodes": summary["response_pairs"],
+                **summary,
                 "status": "PASS" if passed else "FAIL",
             }
         )
-    ordered = all(comparison["status"] == "PASS" for comparison in anchor_comparisons)
+    ordered = anchor_engineering_ok and all(
+        comparison["status"] == "PASS" for comparison in anchor_comparisons
+    )
     model_ordering = _evaluate_model_ordering(
         table,
         specs,
         expected_episodes=len(rows),
+        expected_pair_manifest=expected_pair_manifest,
         compliance=compliance_profile,
         failure_rate_ceiling=failure_rate_ceiling,
     )
+    sampling_contract = None
+    if specs:
+        sampling_contract = {
+            "temperature": float(specs[0].temperature),
+            "top_p": float(specs[0].top_p),
+            "max_tokens": specs[0].max_tokens,
+            "seed_derivation": _REQUEST_SEED_DERIVATION,
+            "seed_version": _REQUEST_SEED_VERSION,
+            "tool_choice": "required",
+            "parallel_tool_calls": False,
+        }
     return {
+        "backend": "replay",
+        "model_specs": [
+            {
+                "label": spec.label,
+                "model": spec.model,
+                "capability_rank": int(spec.capability_rank) if spec.capability_rank is not None else None,
+            }
+            for spec in specs
+        ],
+        "sampling_contract": sampling_contract,
         "tasks": [
             {
                 "prompt_index": row.get("_profile_prompt_index"),
                 "seed": row.get("seed"),
                 "difficulty": row.get("difficulty"),
                 "scenario_id": row.get("scenario_id"),
+                "regime_mix": json.loads(json.dumps(row.get("regime_mix"))),
             }
             for row in task_rows
         ],
@@ -1046,16 +1392,39 @@ def _print_report(report: dict[str, Any]) -> None:
         )
 
 
+def _model_gate_satisfied(model_ordering: Mapping[str, Any], *, configured_models: int) -> bool:
+    if configured_models < 2:
+        return True
+    if model_ordering.get("status") == "PASS":
+        return True
+    return (
+        model_ordering.get("status") == "NOT_EVALUABLE"
+        and model_ordering.get("engineering_status") == "PASS"
+        and model_ordering.get("quality_status") == "NOT_EVALUABLE"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--models", help="JSON file with a list of model specs (see sweep_models.example.json)")
     parser.add_argument("--task-count", type=int, default=5, help="number of deterministic prompts (default 5)")
     parser.add_argument("--repeats", type=int, default=2, help="responses per prompt (default 2)")
     parser.add_argument("--concurrency", type=int, default=8, help="concurrent episodes, 1-32 (default 8)")
-    parser.add_argument(
+    profile = parser.add_mutually_exclusive_group()
+    profile.add_argument(
         "--compliance-profile",
         action="store_true",
         help="run the contribution-guide minimum: 500 prompts x 16 responses",
+    )
+    profile.add_argument(
+        "--engineering-smoke",
+        action="store_true",
+        help="run the Run 1B model/tool engineering gate: 1 prompt x 2 responses",
+    )
+    profile.add_argument(
+        "--benchmark-smoke",
+        action="store_true",
+        help="run the Run 1B pre-expansion benchmark gate: 5 prompts x 2 responses",
     )
     parser.add_argument(
         "--max-failure-rate",
@@ -1076,8 +1445,24 @@ def main() -> None:
         if args.compliance_profile:
             _require_compliance_models(specs)
             _validate_compliance_rows(base_rows)
-        task_count = 500 if args.compliance_profile else args.task_count
-        repeats = 16 if args.compliance_profile else args.repeats
+        elif args.engineering_smoke:
+            _require_ranked_models(specs, "--engineering-smoke")
+            if args.max_failure_rate != 0.0:
+                raise ValueError("--engineering-smoke requires --max-failure-rate 0")
+        elif args.benchmark_smoke:
+            _require_ranked_models(specs, "--benchmark-smoke")
+            if args.max_failure_rate != 0.0:
+                raise ValueError("--benchmark-smoke requires --max-failure-rate 0")
+        task_count = (
+            500
+            if args.compliance_profile
+            else 1
+            if args.engineering_smoke
+            else 5
+            if args.benchmark_smoke
+            else args.task_count
+        )
+        repeats = 16 if args.compliance_profile else 2 if (args.engineering_smoke or args.benchmark_smoke) else args.repeats
         task_rows = _profile_task_rows(base_rows, task_count)
         report = asyncio.run(
             _sweep(
@@ -1086,6 +1471,7 @@ def main() -> None:
                 specs,
                 concurrency=args.concurrency,
                 compliance_profile=args.compliance_profile,
+                run1b_profile=args.engineering_smoke or args.benchmark_smoke,
                 failure_rate_ceiling=args.max_failure_rate,
             )
         )
@@ -1098,8 +1484,10 @@ def main() -> None:
         print(f"report written to {args.out}")
     # Nonzero exit on a broken anchor ladder or a failed/incomplete declared
     # multi-model hierarchy, so the command can be used as a pre-training gate.
-    model_status = report["model_ordering"]["status"]
-    if not report["anchor_ordering_ok"] or (len(specs) >= 2 and model_status != "PASS"):
+    model_gate_ok = _model_gate_satisfied(report["model_ordering"], configured_models=len(specs))
+    if (args.engineering_smoke and not model_gate_ok) or (
+        not args.engineering_smoke and (not report["anchor_ordering_ok"] or not model_gate_ok)
+    ):
         raise SystemExit(1)
 
 

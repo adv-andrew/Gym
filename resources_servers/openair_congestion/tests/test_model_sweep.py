@@ -25,12 +25,14 @@ import random
 import pytest
 from aiohttp import web
 
-from resources_servers.openair_congestion.client import _free_port
+from resources_servers.openair_congestion import model_sweep as model_sweep_module
 from resources_servers.openair_congestion.model_sweep import (
     _ANCHOR_CONSTRAINTS,
     _ANCHOR_ORDER,
     ModelSpec,
+    PolicyStats,
     _evaluate_model_ordering,
+    _llm_action,
     _load_example_rows,
     _make_random_valid,
     _parse_tool_call,
@@ -41,6 +43,290 @@ from resources_servers.openair_congestion.model_sweep import (
     _sweep,
     _validate_compliance_rows,
 )
+
+
+def _free_port():
+    # Import lazily so the source-isolated model_sweep module is fixed in
+    # sys.modules before Ray mutates the namespace-package search path.
+    from resources_servers.openair_congestion.client import _free_port as find_free_port
+
+    return find_free_port()
+
+
+def _episode_record(
+    prompt_index: int,
+    response_index: int,
+    *,
+    scenario_id: str = "bursty",
+    episode_return: float = 0.0,
+    parse_failures: int = 0,
+    invalid_calls: int = 0,
+    usable: bool | None = None,
+) -> dict:
+    if usable is None:
+        usable = parse_failures == 0 and invalid_calls == 0
+    return {
+        "pair_key": f"{prompt_index}:{response_index}",
+        "prompt_index": prompt_index,
+        "response_index": response_index,
+        "scenario_id": scenario_id,
+        "return": episode_return,
+        "usable": usable,
+        "parse_failures": parse_failures,
+        "invalid_calls": invalid_calls,
+    }
+
+
+def _profile_row(label: str, records: list[dict], *, infra_errors: int = 0) -> dict:
+    returns = [float(record["return"]) for record in records]
+    return {
+        "policy": f"model:{label}",
+        "mean_return": sum(returns) / len(returns) if returns else None,
+        "episodes": len(records),
+        "infra_errors": infra_errors,
+        "parse_failures": sum(int(record["parse_failures"]) for record in records),
+        "invalid_calls": sum(int(record["invalid_calls"]) for record in records),
+        "usable_episodes": sum(record["usable"] is True for record in records),
+        "episode_records": records,
+    }
+
+
+def _pair_manifest(*scenario_ids: str, responses: int = 1) -> dict[str, str]:
+    return {
+        f"{prompt_index}:{response_index}": scenario_id
+        for prompt_index, scenario_id in enumerate(scenario_ids)
+        for response_index in range(responses)
+    }
+
+
+def _ordering_result(
+    weak_records: list[dict],
+    strong_records: list[dict],
+    expected_pair_manifest: dict[str, str],
+    *,
+    compliance: bool = True,
+) -> dict:
+    specs = [
+        ModelSpec(label="small", model="small", base_url="http://x", capability_rank=1),
+        ModelSpec(label="frontier", model="frontier", base_url="http://x", capability_rank=2),
+    ]
+    return _evaluate_model_ordering(
+        [_profile_row("small", weak_records), _profile_row("frontier", strong_records)],
+        specs,
+        expected_episodes=len(expected_pair_manifest),
+        expected_pair_manifest=expected_pair_manifest,
+        compliance=compliance,
+    )
+
+
+def test_model_ordering_rejects_pair_key_coordinate_disagreement():
+    specs = [
+        ModelSpec(label="small", model="small", base_url="http://x", capability_rank=1),
+        ModelSpec(label="frontier", model="frontier", base_url="http://x", capability_rank=2),
+    ]
+    malformed = _episode_record(0, 0)
+    malformed["prompt_index"] = 99
+    profile = [
+        _profile_row("small", [malformed]),
+        _profile_row("frontier", [{**malformed, "return": 1.0}]),
+    ]
+
+    result = _evaluate_model_ordering(
+        profile,
+        specs,
+        expected_episodes=1,
+        expected_pair_manifest=_pair_manifest("bursty"),
+        compliance=True,
+    )
+
+    assert result["status"] == "NOT_EVALUABLE"
+    assert "pair_key" in result["reason"]
+
+
+@pytest.mark.parametrize("coordinate", ["prompt_index", "response_index"])
+def test_model_ordering_rejects_boolean_explicit_coordinates(coordinate):
+    weak = _episode_record(0, 0)
+    weak[coordinate] = False
+
+    result = _ordering_result(
+        [weak],
+        [_episode_record(0, 0, episode_return=1.0)],
+        _pair_manifest("bursty"),
+    )
+
+    assert result["status"] == "NOT_EVALUABLE"
+    assert f".{coordinate} must be a non-negative integer" in result["reason"]
+
+
+@pytest.mark.parametrize(
+    "mutate, reason",
+    [
+        (lambda record: record.update(pair_key="0"), "pair_key"),
+        (lambda record: record.update(pair_key="1:0", prompt_index=1), "planned prompt/repeat support"),
+        (lambda record: record.update(scenario_id="interference"), "task manifest"),
+        (lambda record: record.update(return_=float("nan")), "finite number"),
+    ],
+)
+def test_model_ordering_rejects_malformed_or_out_of_manifest_records(mutate, reason):
+    weak = _episode_record(0, 0)
+    if reason == "finite number":
+        weak["return"] = float("nan")
+    else:
+        mutate(weak)
+    strong = {**weak, "return": 1.0} if reason != "finite number" else _episode_record(0, 0, episode_return=1.0)
+
+    result = _ordering_result([weak], [strong], _pair_manifest("bursty"))
+
+    assert result["status"] == "NOT_EVALUABLE"
+    assert reason in result["reason"]
+
+
+@pytest.mark.parametrize(
+    "record_updates, row_updates, reason",
+    [
+        ({"usable": "false"}, {}, "usable"),
+        ({"usable": False}, {}, "usable"),
+        ({"parse_failures": True, "usable": False}, {}, "parse_failures"),
+        ({"parse_failures": 1, "usable": False}, {"parse_failures": 0}, "parse_failures disagree"),
+        ({}, {"usable_episodes": 0}, "usable_episodes disagree"),
+        ({}, {"mean_return": float("nan")}, "mean_return must be a finite number"),
+        ({}, {"mean_return": 99.0}, "mean_return disagrees"),
+    ],
+)
+def test_model_ordering_rejects_malformed_failure_accounting(record_updates, row_updates, reason):
+    weak = _episode_record(0, 0)
+    weak.update(record_updates)
+    weak_row = _profile_row("small", [weak])
+    weak_row.update(row_updates)
+    strong = _episode_record(0, 0, episode_return=1.0)
+    specs = [
+        ModelSpec(label="small", model="small", base_url="http://x", capability_rank=1),
+        ModelSpec(label="frontier", model="frontier", base_url="http://x", capability_rank=2),
+    ]
+
+    result = _evaluate_model_ordering(
+        [weak_row, _profile_row("frontier", [strong])],
+        specs,
+        expected_episodes=1,
+        expected_pair_manifest=_pair_manifest("bursty"),
+        compliance=True,
+    )
+
+    assert result["status"] == "NOT_EVALUABLE"
+    assert reason in result["reason"]
+
+
+def test_model_ordering_rejects_duplicate_or_incomplete_cartesian_coordinates():
+    manifest = _pair_manifest("bursty", responses=2)
+    duplicate = _episode_record(0, 0)
+    weak = [duplicate, dict(duplicate)]
+    strong = [_episode_record(0, 0, episode_return=1.0), _episode_record(0, 1, episode_return=1.0)]
+
+    result = _ordering_result(weak, strong, manifest)
+
+    assert result["status"] == "NOT_EVALUABLE"
+    assert "duplicate" in result["reason"]
+
+
+@pytest.mark.parametrize(
+    "manifest, reason",
+    [
+        ({"0:0": "bursty", "0:1": "interference"}, "exactly one scenario"),
+        ({"0:0": "bursty", "1:1": "interference"}, "Cartesian"),
+    ],
+)
+def test_model_ordering_rejects_noncartesian_or_multiregime_prompt_manifest(manifest, reason):
+    weak = [
+        _episode_record(*map(int, pair_key.split(":")), scenario_id=scenario_id)
+        for pair_key, scenario_id in manifest.items()
+    ]
+    strong = [{**record, "return": 1.0} for record in weak]
+
+    with pytest.raises(ValueError, match=reason):
+        _ordering_result(weak, strong, manifest)
+
+
+def test_anchor_comparisons_validate_both_policies_against_the_task_manifest(monkeypatch):
+    seen_stats = []
+
+    async def fake_run_episode(base_url, row, action_fn, stats):
+        stats_index = next((index for index, candidate in enumerate(seen_stats) if candidate is stats), None)
+        if stats_index is None:
+            seen_stats.append(stats)
+            stats_index = len(seen_stats) - 1
+        stats.finish_episode(
+            float(4 - stats_index),
+            scenario_id=row["scenario_id"],
+            tool_counts={"noop": 1},
+            rejected_steps=0,
+            episode_steps=1,
+            pair_key=f"{row['_profile_prompt_index']}:{row['_profile_response_index']}",
+            parse_failures=0,
+            invalid_calls=0,
+        )
+        # _ANCHORS insertion order is relief, random-valid, noop, catastrophic.
+        # Corrupt only the worse side of relief > noop; checking the better side
+        # alone would miss this and could still issue an anchor PASS.
+        if stats_index == 2:
+            stats.episode_records[-1]["scenario_id"] = "wrong-regime"
+
+    monkeypatch.setattr(model_sweep_module, "_start_local_server", lambda: "http://unused")
+    monkeypatch.setattr(model_sweep_module, "_run_episode", fake_run_episode)
+    rows = _profile_task_rows(_load_example_rows(), task_count=1)
+
+    with pytest.raises(ValueError, match=r"anchor:noop.*task manifest"):
+        asyncio.run(_sweep(rows, repeats=1, specs=[], concurrency=1))
+
+
+def test_anchor_environment_gate_fails_on_structurally_invalid_anchor_record(monkeypatch):
+    seen_stats = []
+
+    async def fake_run_episode(base_url, row, action_fn, stats):
+        stats_index = next((index for index, candidate in enumerate(seen_stats) if candidate is stats), None)
+        if stats_index is None:
+            seen_stats.append(stats)
+            stats_index = len(seen_stats) - 1
+        # In insertion order, these returns make every declared anchor
+        # comparison positive.  The relief record is nevertheless unusable,
+        # so reward ordering alone must not qualify the environment gate.
+        returns = (4.0, 3.0, 2.0, 1.0)
+        stats.invalid_calls += int(stats_index == 0)
+        stats.finish_episode(
+            returns[stats_index],
+            scenario_id=row["scenario_id"],
+            tool_counts={"noop": 1},
+            rejected_steps=0,
+            episode_steps=1,
+            pair_key=f"{row['_profile_prompt_index']}:{row['_profile_response_index']}",
+            parse_failures=0,
+            invalid_calls=int(stats_index == 0),
+        )
+
+    monkeypatch.setattr(model_sweep_module, "_start_local_server", lambda: "http://unused")
+    monkeypatch.setattr(model_sweep_module, "_run_episode", fake_run_episode)
+    rows = _profile_task_rows(_load_example_rows(), task_count=1)
+
+    report = asyncio.run(_sweep(rows, repeats=1, specs=[], concurrency=1))
+
+    assert all(comparison["status"] == "PASS" for comparison in report["anchor_ordering_comparisons"])
+    assert report["anchor_ordering_ok"] is False
+
+
+def test_episode_records_expose_prompt_and_response_coordinates():
+    stats = PolicyStats()
+    stats.finish_episode(
+        1.25,
+        scenario_id="bursty",
+        tool_counts={"noop": 1},
+        rejected_steps=0,
+        episode_steps=1,
+        pair_key="7:3",
+        parse_failures=0,
+        invalid_calls=0,
+    )
+
+    assert stats.episode_records[0]["prompt_index"] == 7
+    assert stats.episode_records[0]["response_index"] == 3
 
 
 def test_anchor_sweep_orders_policies_and_reports_profile():
@@ -63,6 +349,14 @@ def test_anchor_sweep_orders_policies_and_reports_profile():
     assert len(report["anchor_ordering_comparisons"]) == len(_ANCHOR_CONSTRAINTS)
     assert all(
         comparison["status"] == "PASS" and comparison["ci95_low"] > 0.0
+        for comparison in report["anchor_ordering_comparisons"]
+    )
+    assert all(
+        comparison["bootstrap_method"] == "regime_stratified_prompt_cluster_percentile"
+        and comparison["bootstrap_draws"] == 10_000
+        and comparison["prompt_clusters"] == 5
+        and comparison["response_pairs"] == 5
+        and comparison["prompt_wins"] + comparison["prompt_ties"] + comparison["prompt_losses"] == 5
         for comparison in report["anchor_ordering_comparisons"]
     )
 
@@ -98,43 +392,141 @@ def test_profile_rows_cover_every_example_regime_and_repeat_exact_prompts():
 
 
 def test_model_ordering_requires_ranked_models_to_improve_monotonically():
+    manifest = _pair_manifest(*(tuple("bursty" for _ in range(8))))
+    weak = [_episode_record(index, 0, episode_return=-4.0) for index in range(8)]
+    stronger = [_episode_record(index, 0, episode_return=-3.0) for index in range(8)]
+
+    assert _ordering_result(weak, stronger, manifest, compliance=False)["status"] == "PASS"
+
+    weaker_frontier = [_episode_record(index, 0, episode_return=-5.0) for index in range(8)]
+    result = _ordering_result(weak, weaker_frontier, manifest, compliance=False)
+    assert result["status"] == "FAIL"
+    assert result["expected"] == ["model:small", "model:frontier"]
+
+
+def test_model_ordering_bootstraps_regime_stratified_prompt_clusters():
+    weak_records = []
+    strong_records = []
+    # Each regime has two prompt clusters with the same within-regime delta.
+    # The interval is therefore deterministic at the prompt level even though
+    # 64 response deltas exist; response-level resampling would count the wrong
+    # experimental unit.
+    prompt_contract = (("bursty", 10.0), ("bursty", 10.0), ("interference", -2.0), ("interference", -2.0))
+    for prompt_index, (scenario_id, delta) in enumerate(prompt_contract):
+        for response_index in range(16):
+            weak_records.append(_episode_record(prompt_index, response_index, scenario_id=scenario_id))
+            strong_records.append(
+                _episode_record(prompt_index, response_index, scenario_id=scenario_id, episode_return=delta)
+            )
+
+    manifest = _pair_manifest(*(scenario for scenario, _delta in prompt_contract), responses=16)
+    comparison = _ordering_result(weak_records, strong_records, manifest, compliance=False)["comparisons"][0]
+
+    assert comparison["bootstrap_method"] == "regime_stratified_prompt_cluster_percentile"
+    assert comparison["bootstrap_seed"] == 0
+    assert comparison["bootstrap_draws"] == 10_000
+    assert comparison["prompt_clusters"] == 4
+    assert comparison["response_pairs"] == 64
+    assert comparison["mean_delta"] == 4.0
+    assert comparison["median_delta"] == 4.0
+    assert comparison["ci95_low"] == 4.0
+    assert comparison["ci95_high"] == 4.0
+    assert comparison["prompt_wins"] == 2
+    assert comparison["prompt_ties"] == 0
+    assert comparison["prompt_losses"] == 2
+
+
+def test_model_ordering_preserves_gate_precision_in_raw_comparison_fields():
+    manifest = _pair_manifest("bursty", "bursty")
+    weak = [_episode_record(0, 0), _episode_record(1, 0)]
+    strong = [
+        _episode_record(0, 0, episode_return=0.0000004),
+        _episode_record(1, 0, episode_return=0.0000004),
+    ]
+
+    result = _ordering_result(weak, strong, manifest, compliance=False)
+    comparison = result["comparisons"][0]
+
+    assert comparison["status"] == "PASS"
+    assert comparison["mean_delta"] == pytest.approx(0.0000004)
+    assert comparison["ci95_low"] == pytest.approx(0.0000004)
+    assert comparison["mean_delta"] > 0.0 and comparison["ci95_low"] > 0.0
+
+
+def test_singleton_regime_smoke_is_engineering_only_not_a_quality_pass():
+    scenarios = ("prb_exhaustion", "bursty", "interference", "prach_storm", "qos_competition")
+    manifest = _pair_manifest(*scenarios)
+    weak = [
+        _episode_record(prompt_index, 0, scenario_id=scenario_id)
+        for prompt_index, scenario_id in enumerate(scenarios)
+    ]
+    strong = [{**record, "return": 1.0} for record in weak]
+
+    result = _ordering_result(weak, strong, manifest, compliance=False)
+
+    assert result["status"] == "NOT_EVALUABLE"
+    assert result["engineering_status"] == "PASS"
+    assert result["quality_status"] == "NOT_EVALUABLE"
+    assert result["comparisons"] == []
+    assert "two prompt clusters per scenario" in result["reason"]
+
+
+def test_quality_inference_counts_planned_scenarios_with_zero_common_usable_prompts():
+    manifest = _pair_manifest("bursty", "bursty", "interference", "interference")
+    weak = [
+        _episode_record(index, 0, scenario_id=scenario_id)
+        for index, scenario_id in enumerate(("bursty", "bursty", "interference", "interference"))
+    ]
+    strong = [
+        _episode_record(
+            index,
+            0,
+            scenario_id=scenario_id,
+            episode_return=1.0,
+            parse_failures=int(scenario_id == "interference"),
+        )
+        for index, scenario_id in enumerate(("bursty", "bursty", "interference", "interference"))
+    ]
     specs = [
         ModelSpec(label="small", model="small", base_url="http://x", capability_rank=1),
         ModelSpec(label="frontier", model="frontier", base_url="http://x", capability_rank=2),
     ]
-    passing = [
-        {
-            "policy": "model:small",
-            "mean_return": -4.0,
-            "episodes": 8,
-            "infra_errors": 0,
-            "parse_failures": 0,
-            "invalid_calls": 0,
-            "episode_records": [{"pair_key": str(index), "return": -4.0, "usable": True} for index in range(8)],
-        },
-        {
-            "policy": "model:frontier",
-            "mean_return": -3.0,
-            "episodes": 8,
-            "infra_errors": 0,
-            "parse_failures": 0,
-            "invalid_calls": 0,
-            "episode_records": [{"pair_key": str(index), "return": -3.0, "usable": True} for index in range(8)],
-        },
-    ]
-    assert _evaluate_model_ordering(passing, specs, expected_episodes=8)["status"] == "PASS"
 
-    failing = [
-        dict(passing[0]),
-        dict(
-            passing[1],
-            mean_return=-5.0,
-            episode_records=[{"pair_key": str(index), "return": -5.0, "usable": True} for index in range(8)],
-        ),
-    ]
-    result = _evaluate_model_ordering(failing, specs, expected_episodes=8)
-    assert result["status"] == "FAIL"
-    assert result["expected"] == ["model:small", "model:frontier"]
+    result = _evaluate_model_ordering(
+        [_profile_row("small", weak), _profile_row("frontier", strong)],
+        specs,
+        expected_episodes=4,
+        expected_pair_manifest=manifest,
+        compliance=False,
+        failure_rate_ceiling=0.5,
+    )
+
+    assert result["status"] == "NOT_EVALUABLE"
+    assert "interference" in result["reason"]
+
+
+def test_cli_gate_allows_only_explicit_engineering_only_smoke_to_progress():
+    engineering_only = {
+        "status": "NOT_EVALUABLE",
+        "engineering_status": "PASS",
+        "quality_status": "NOT_EVALUABLE",
+    }
+    malformed = {"status": "NOT_EVALUABLE", "reason": "incomplete records"}
+
+    assert model_sweep_module._model_gate_satisfied(engineering_only, configured_models=2) is True
+    assert model_sweep_module._model_gate_satisfied(malformed, configured_models=2) is False
+    assert model_sweep_module._model_gate_satisfied({"status": "FAIL"}, configured_models=2) is False
+    assert model_sweep_module._model_gate_satisfied({"status": "PASS"}, configured_models=2) is True
+
+
+def test_compliance_model_ordering_uses_fifty_thousand_cluster_draws():
+    manifest = _pair_manifest("bursty", "bursty")
+    weak = [_episode_record(0, 0), _episode_record(1, 0)]
+    strong = [_episode_record(0, 0, episode_return=1.0), _episode_record(1, 0, episode_return=1.0)]
+
+    comparison = _ordering_result(weak, strong, manifest, compliance=True)["comparisons"][0]
+
+    assert comparison["bootstrap_draws"] == 50_000
 
 
 def test_all_parse_failures_are_not_evaluable():
@@ -142,30 +534,26 @@ def test_all_parse_failures_are_not_evaluable():
         ModelSpec(label="small", model="small", base_url="http://x", capability_rank=1),
         ModelSpec(label="frontier", model="frontier", base_url="http://x", capability_rank=2),
     ]
-    profile = [
-        {
-            "policy": f"model:{label}",
-            "mean_return": -1.0 + rank,
-            "episodes": 500,
-            "infra_errors": 0,
-            "parse_failures": 500,
-            "invalid_calls": 0,
-            "episode_records": [
-                {
-                    "pair_key": str(index),
-                    "return": -1.0 + rank,
-                    "usable": False,
-                }
-                for index in range(500)
-            ],
-        }
-        for rank, label in enumerate(("small", "frontier"))
-    ]
+    manifest = _pair_manifest(*(tuple("bursty" for _ in range(8))))
+    profile = []
+    for rank, label in enumerate(("small", "frontier")):
+        records = [
+            _episode_record(
+                index,
+                0,
+                episode_return=-1.0 + rank,
+                parse_failures=1,
+                usable=False,
+            )
+            for index in range(8)
+        ]
+        profile.append(_profile_row(label, records))
 
     result = _evaluate_model_ordering(
         profile,
         specs,
-        expected_episodes=500,
+        expected_episodes=8,
+        expected_pair_manifest=manifest,
     )
 
     assert result["status"] == "NOT_EVALUABLE"
@@ -178,31 +566,24 @@ def test_partial_parse_failures_are_not_evaluable():
         ModelSpec(label="frontier", model="frontier", base_url="http://x", capability_rank=2),
     ]
     profile = []
+    manifest = _pair_manifest(*(tuple("bursty" for _ in range(8))))
     for rank, label in enumerate(("small", "frontier")):
         records = [
-            {
-                "pair_key": str(index),
-                "return": float(rank),
-                "usable": not (label == "frontier" and index == 0),
-            }
+            _episode_record(
+                index,
+                0,
+                episode_return=float(rank),
+                parse_failures=int(label == "frontier" and index == 0),
+            )
             for index in range(8)
         ]
-        profile.append(
-            {
-                "policy": f"model:{label}",
-                "mean_return": float(rank),
-                "episodes": 8,
-                "infra_errors": 0,
-                "parse_failures": int(label == "frontier"),
-                "invalid_calls": 0,
-                "episode_records": records,
-            }
-        )
+        profile.append(_profile_row(label, records))
 
     result = _evaluate_model_ordering(
         profile,
         specs,
         expected_episodes=8,
+        expected_pair_manifest=manifest,
     )
 
     assert result["status"] == "NOT_EVALUABLE"
@@ -214,31 +595,24 @@ def test_noncompliance_failure_ceiling_uses_only_common_usable_pairs():
         ModelSpec(label="frontier", model="frontier", base_url="http://x", capability_rank=2),
     ]
     profile = []
+    manifest = _pair_manifest(*(tuple("bursty" for _ in range(8))))
     for rank, label in enumerate(("small", "frontier")):
         records = [
-            {
-                "pair_key": str(index),
-                "return": float(rank),
-                "usable": not (label == "frontier" and index == 0),
-            }
+            _episode_record(
+                index,
+                0,
+                episode_return=float(rank),
+                parse_failures=int(label == "frontier" and index == 0),
+            )
             for index in range(8)
         ]
-        profile.append(
-            {
-                "policy": f"model:{label}",
-                "mean_return": float(rank),
-                "episodes": 8,
-                "infra_errors": 0,
-                "parse_failures": int(label == "frontier"),
-                "invalid_calls": 0,
-                "episode_records": records,
-            }
-        )
+        profile.append(_profile_row(label, records))
 
     result = _evaluate_model_ordering(
         profile,
         specs,
         expected_episodes=8,
+        expected_pair_manifest=manifest,
         compliance=False,
         failure_rate_ceiling=0.125,
     )
@@ -249,35 +623,57 @@ def test_noncompliance_failure_ceiling_uses_only_common_usable_pairs():
     assert result["comparisons"][0]["paired_episodes"] == 7
 
 
+def test_noncompliance_accepts_multiple_step_failures_in_one_unusable_episode():
+    manifest = _pair_manifest("bursty", "bursty", "bursty")
+    weak = [_episode_record(index, 0) for index in range(3)]
+    strong = [
+        _episode_record(0, 0, episode_return=1.0, parse_failures=2),
+        _episode_record(1, 0, episode_return=1.0),
+        _episode_record(2, 0, episode_return=1.0),
+    ]
+    specs = [
+        ModelSpec(label="small", model="small", base_url="http://x", capability_rank=1),
+        ModelSpec(label="frontier", model="frontier", base_url="http://x", capability_rank=2),
+    ]
+
+    result = _evaluate_model_ordering(
+        [_profile_row("small", weak), _profile_row("frontier", strong)],
+        specs,
+        expected_episodes=3,
+        expected_pair_manifest=manifest,
+        compliance=False,
+        failure_rate_ceiling=2 / 3,
+    )
+
+    assert result["status"] == "PASS"
+    assert result["valid_paired_episodes"] == 2
+    assert result["failure_counts"]["model:frontier"]["parse_failures"] == 2
+
+
 def test_noncompliance_failure_ceiling_rejects_profiles_above_limit():
     specs = [
         ModelSpec(label="small", model="small", base_url="http://x", capability_rank=1),
         ModelSpec(label="frontier", model="frontier", base_url="http://x", capability_rank=2),
     ]
-    profile = [
-        {
-            "policy": f"model:{label}",
-            "mean_return": float(rank),
-            "episodes": 4,
-            "infra_errors": 0,
-            "parse_failures": 1 if label == "frontier" else 0,
-            "invalid_calls": 0,
-            "episode_records": [
-                {
-                    "pair_key": str(index),
-                    "return": float(rank),
-                    "usable": not (label == "frontier" and index == 0),
-                }
-                for index in range(4)
-            ],
-        }
-        for rank, label in enumerate(("small", "frontier"))
-    ]
+    manifest = _pair_manifest(*(tuple("bursty" for _ in range(4))))
+    profile = []
+    for rank, label in enumerate(("small", "frontier")):
+        records = [
+            _episode_record(
+                index,
+                0,
+                episode_return=float(rank),
+                parse_failures=int(label == "frontier" and index == 0),
+            )
+            for index in range(4)
+        ]
+        profile.append(_profile_row(label, records))
 
     result = _evaluate_model_ordering(
         profile,
         specs,
         expected_episodes=4,
+        expected_pair_manifest=manifest,
         compliance=False,
         failure_rate_ceiling=0.20,
     )
@@ -292,40 +688,19 @@ def test_positive_mean_with_interval_crossing_zero_fails():
         ModelSpec(label="frontier", model="frontier", base_url="http://x", capability_rank=2),
     ]
     deltas = [-0.1, 0.1, 0.1, -0.05]
-    weak_records = [{"pair_key": str(index), "return": 0.0, "usable": True} for index in range(len(deltas))]
+    weak_records = [_episode_record(index, 0) for index in range(len(deltas))]
     strong_records = [
-        {
-            "pair_key": str(index),
-            "return": delta,
-            "usable": True,
-        }
+        _episode_record(index, 0, episode_return=delta)
         for index, delta in enumerate(deltas)
     ]
-    profile = [
-        {
-            "policy": "model:small",
-            "mean_return": 0.0,
-            "episodes": len(deltas),
-            "infra_errors": 0,
-            "parse_failures": 0,
-            "invalid_calls": 0,
-            "episode_records": weak_records,
-        },
-        {
-            "policy": "model:frontier",
-            "mean_return": sum(deltas) / len(deltas),
-            "episodes": len(deltas),
-            "infra_errors": 0,
-            "parse_failures": 0,
-            "invalid_calls": 0,
-            "episode_records": strong_records,
-        },
-    ]
+    profile = [_profile_row("small", weak_records), _profile_row("frontier", strong_records)]
+    manifest = _pair_manifest(*(tuple("bursty" for _ in deltas)))
 
     result = _evaluate_model_ordering(
         profile,
         specs,
         expected_episodes=len(deltas),
+        expected_pair_manifest=manifest,
     )
 
     assert result["status"] == "FAIL"
@@ -362,6 +737,163 @@ def test_compliance_profile_requires_two_preranked_models():
     ]
     with pytest.raises(ValueError, match="non-empty"):
         _require_compliance_models(missing_identity)
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"temperature": float("nan")}, "temperature"),
+        ({"temperature": -0.01}, "temperature"),
+        ({"temperature": 2.01}, "temperature"),
+        ({"max_tokens": 0}, "max_tokens"),
+        ({"max_tokens": True}, "max_tokens"),
+        ({"max_tokens": 513}, "max_tokens"),
+    ],
+)
+def test_model_spec_rejects_unsafe_temperature_and_token_limits(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        ModelSpec(label="model", model="model", base_url="http://x", **kwargs)
+
+
+@pytest.mark.parametrize("capability_rank", [True, 0, -1, 1.5, "1"])
+def test_model_spec_rejects_nonpositive_or_noninteger_capability_rank(capability_rank):
+    with pytest.raises(ValueError, match="capability_rank"):
+        ModelSpec(
+            label="model",
+            model="model",
+            base_url="http://x",
+            capability_rank=capability_rank,
+        )
+
+
+def test_model_spec_pins_top_p_instead_of_inheriting_endpoint_defaults():
+    spec = ModelSpec(label="model", model="model", base_url="http://x")
+
+    assert getattr(spec, "top_p", None) == 0.95
+    assert spec.max_tokens == 512
+
+
+@pytest.mark.parametrize("top_p", [float("nan"), 0.0, -0.01, 1.01, True])
+def test_model_spec_rejects_unsafe_top_p(top_p):
+    with pytest.raises(ValueError, match="top_p"):
+        ModelSpec(label="model", model="model", base_url="http://x", top_p=top_p)
+
+
+def test_llm_request_pins_identical_sampling_and_pair_derived_seed_across_models():
+    class Response:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        async def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [{"function": {"name": "noop", "arguments": "{}"}}],
+                            "content": None,
+                        }
+                    }
+                ]
+            }
+
+    class Session:
+        def __init__(self):
+            self.payloads = []
+
+        def post(self, url, *, json, headers, timeout):
+            self.payloads.append(json)
+            return Response()
+
+    row = _profile_task_rows(_load_example_rows(), task_count=8)[7]
+    row["_profile_response_index"] = 3
+    session = Session()
+    decoding = {"temperature": 0.3, "top_p": 0.85, "max_tokens": 256}
+    specs = [
+        ModelSpec(label="small", model="small", base_url="http://x", **decoding),
+        ModelSpec(label="frontier", model="frontier", base_url="http://x", **decoding),
+    ]
+
+    for spec in specs:
+        action = asyncio.run(_llm_action(session, spec, row, "- Cell 0: state", step_idx=4))
+        assert action == {"name": "noop", "arguments": {}}
+
+    sampling_contracts = [
+        {key: payload[key] for key in ("temperature", "top_p", "max_tokens", "seed")}
+        for payload in session.payloads
+    ]
+    assert sampling_contracts == [
+        {"temperature": 0.3, "top_p": 0.85, "max_tokens": 256, "seed": 756_251_775},
+        {"temperature": 0.3, "top_p": 0.85, "max_tokens": 256, "seed": 756_251_775},
+    ]
+
+
+def test_sweep_report_binds_credential_free_model_sampling_backend_and_task_contract(monkeypatch):
+    seen_stats = []
+
+    async def fake_run_episode(base_url, row, action_fn, stats):
+        stats_index = next((index for index, candidate in enumerate(seen_stats) if candidate is stats), None)
+        if stats_index is None:
+            seen_stats.append(stats)
+            stats_index = len(seen_stats) - 1
+        stats.finish_episode(
+            float(stats_index),
+            scenario_id=row["scenario_id"],
+            tool_counts={"noop": 1},
+            rejected_steps=0,
+            episode_steps=1,
+            pair_key=f"{row['_profile_prompt_index']}:{row['_profile_response_index']}",
+            parse_failures=0,
+            invalid_calls=0,
+        )
+
+    monkeypatch.setattr(model_sweep_module, "_start_local_server", lambda: "http://unused")
+    monkeypatch.setattr(model_sweep_module, "_run_episode", fake_run_episode)
+    rows = _profile_task_rows(_load_example_rows(), task_count=2)
+    specs = [
+        ModelSpec(
+            label="small",
+            model="Qwen/Qwen3-1.7B",
+            base_url="https://user:never-serialize@example.invalid/v1",
+            temperature=0.3,
+            top_p=0.85,
+            max_tokens=256,
+            capability_rank=1,
+        ),
+        ModelSpec(
+            label="large",
+            model="Qwen/Qwen3-8B",
+            base_url="https://user:never-serialize@example.invalid/v1",
+            temperature=0.3,
+            top_p=0.85,
+            max_tokens=256,
+            capability_rank=2,
+        ),
+    ]
+
+    report = asyncio.run(_sweep(rows, repeats=1, specs=specs, concurrency=1))
+
+    assert report["backend"] == "replay"
+    assert report["model_specs"] == [
+        {"label": "small", "model": "Qwen/Qwen3-1.7B", "capability_rank": 1},
+        {"label": "large", "model": "Qwen/Qwen3-8B", "capability_rank": 2},
+    ]
+    assert report["sampling_contract"] == {
+        "temperature": 0.3,
+        "top_p": 0.85,
+        "max_tokens": 256,
+        "seed_derivation": "sha256(run1b-request-v1:{prompt_index}:{response_index}:{step_index}) mod 2**31",
+        "seed_version": "run1b-request-v1",
+        "tool_choice": "required",
+        "parallel_tool_calls": False,
+    }
+    assert report["tasks"][0]["regime_mix"] == {"prb_exhaustion": 1.0}
+    assert "never-serialize" not in json.dumps(report)
 
 
 def test_compliance_profile_requires_exact_one_hot_regime_coverage():
@@ -498,6 +1030,19 @@ def test_llm_policies_end_to_end_against_mock_endpoint():
     assert any(t["function"]["name"] == "set_prb_cap" for t in payload["tools"])
     assert payload["tool_choice"] == "required"
     assert payload["parallel_tool_calls"] is False
+    first_payload_by_model = {}
+    for candidate in seen_payloads:
+        first_payload_by_model.setdefault(candidate["model"], candidate)
+    assert set(first_payload_by_model) == {"dead", "cooperative", "hallucinator", "rambler"}
+    assert {
+        (
+            candidate["temperature"],
+            candidate["top_p"],
+            candidate["max_tokens"],
+            candidate["seed"],
+        )
+        for candidate in first_payload_by_model.values()
+    } == {(0.2, 0.95, 512, 355_554_858)}
 
 
 def test_sweep_rejects_bad_config():
@@ -510,6 +1055,52 @@ def test_sweep_rejects_bad_config():
     with pytest.raises(ValueError, match="duplicate model labels"):
         asyncio.run(_sweep(_profile_task_rows(_load_example_rows(), 1), repeats=1, specs=dup))
 
+    mismatched_sampling = [
+        ModelSpec(label="small", model="small", base_url="http://x", temperature=0.2, capability_rank=1),
+        ModelSpec(label="frontier", model="frontier", base_url="http://x", temperature=0.3, capability_rank=2),
+    ]
+    with pytest.raises(ValueError, match="identical sampling"):
+        asyncio.run(
+            _sweep(
+                _profile_task_rows(_load_example_rows(), 1),
+                repeats=1,
+                specs=mismatched_sampling,
+            )
+        )
+
+
+def test_compliance_profile_rejects_identical_but_nonfrozen_sampling():
+    specs = [
+        ModelSpec(
+            label="small",
+            model="small",
+            base_url="http://127.0.0.1:1/v1",
+            temperature=0.3,
+            top_p=0.95,
+            max_tokens=512,
+            capability_rank=1,
+        ),
+        ModelSpec(
+            label="large",
+            model="large",
+            base_url="http://127.0.0.1:1/v1",
+            temperature=0.3,
+            top_p=0.95,
+            max_tokens=512,
+            capability_rank=2,
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="frozen sampling contract"):
+        asyncio.run(
+            _sweep(
+                _profile_task_rows(_load_example_rows(), 1),
+                repeats=1,
+                specs=specs,
+                compliance_profile=True,
+            )
+        )
+
 
 def test_sweep_refuses_named_but_unset_api_key_env(monkeypatch):
     monkeypatch.delenv("SWEEP_TEST_MISSING_KEY", raising=False)
@@ -518,7 +1109,7 @@ def test_sweep_refuses_named_but_unset_api_key_env(monkeypatch):
         asyncio.run(_sweep(_profile_task_rows(_load_example_rows(), 1), repeats=1, specs=[spec]))
 
 
-def test_parse_tool_call_handles_tool_calls_content_json_and_garbage():
+def test_parse_tool_call_accepts_one_native_call_and_rejects_content_json_or_garbage():
     native = {
         "tool_calls": [{"function": {"name": "noop", "arguments": "{}"}}],
         "content": None,
@@ -526,10 +1117,7 @@ def test_parse_tool_call_handles_tool_calls_content_json_and_garbage():
     assert _parse_tool_call(native) == {"name": "noop", "arguments": {}}
 
     content = {"content": 'Sure: {"name": "set_scheduler_policy", "arguments": {"cell_id": 0, "policy": "PF"}}'}
-    assert _parse_tool_call(content) == {
-        "name": "set_scheduler_policy",
-        "arguments": {"cell_id": 0, "policy": "PF"},
-    }
+    assert _parse_tool_call(content) is None
 
     assert _parse_tool_call({"content": "I would consider the network first."}) is None
     assert _parse_tool_call({"tool_calls": [{"function": {"name": "noop", "arguments": "{not json"}}]}) is None

@@ -5,6 +5,8 @@
     "base_url": "https://frontier-api.example.invalid/v1",
     "api_key_env": "FRONTIER_MODEL_API_KEY",
     "temperature": 0.2,
+    "top_p": 0.95,
+    "max_tokens": 512,
     "capability_rank": 2
   },
   {
@@ -13,6 +15,8 @@
     "base_url": "https://small-model-api.example.invalid/v1",
     "api_key_env": "SMALL_MODEL_API_KEY",
     "temperature": 0.2,
+    "top_p": 0.95,
+    "max_tokens": 512,
     "capability_rank": 1
   }
 ]

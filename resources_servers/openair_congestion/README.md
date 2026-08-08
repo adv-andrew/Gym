@@ -338,6 +338,59 @@ Adding a tool also crosses several explicit boundaries:
 
 ## Environment-quality checks
 
+### Run 1B evaluation contract
+
+`Run 1B` is shorthand for the strict real-model capability sweep. It is an
+evaluation run: it serves fixed checkpoints and never creates an optimizer or
+updates model weights. It is unrelated to the historical Run B GRPO job and
+to the RunB2 SFT/GRPO lineage.
+
+The frozen decoding contract is identical for every learned model:
+
+- temperature `0.2`, top-p `0.95`, and exactly `512` maximum output tokens;
+- exactly one tool call and no parallel tool calls; and
+- a deterministic request seed derived from prompt index, response index, and
+  environment step.
+
+For locally served Qwen3 checkpoints, start vLLM from an immutable
+linux/amd64 image digest and record that digest in the receipt. Do not use a
+mutable tag as the experiment identity. The server launch must also disable
+model-repository generation defaults and enable the matching tool and
+reasoning parsers:
+
+```bash
+docker run --rm --gpus '"device=0"' --network host \
+  -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
+  -v /absolute/model-cache:/models:ro \
+  vllm/vllm-openai@sha256:<linux-amd64-platform-digest> \
+  --model /models/<exact-snapshot> \
+  --served-model-name qwen3-1.7b \
+  --port 18001 --seed 0 --max-model-len 4096 \
+  --generation-config vllm \
+  --enable-auto-tool-choice --tool-call-parser hermes \
+  --reasoning-parser qwen3
+```
+
+Use a separate GPU and port for the second checkpoint. Check `/v1/models`,
+then run the executable one-prompt/two-response gate for both declared models:
+
+```bash
+python resources_servers/openair_congestion/model_sweep.py \
+  --engineering-smoke \
+  --models /absolute/path/run1b_models.json \
+  --concurrency 2 \
+  --max-failure-rate 0 \
+  --out /absolute/path/run1b_tool_smoke_raw.json
+```
+
+This flag freezes the shape to one prompt by two response-indexed rollouts and
+freezes sampling to `0.2 / 0.95 / 512`. It succeeds only when both models have
+complete support with zero infrastructure, native-tool parsing, and invalid
+call failures. The raw JSON is the retained gate receipt. Content-only JSON is
+not accepted as a tool call, so a broken vLLM tool parser cannot qualify. This
+is only a model-server/tool-path engineering smoke; its model-quality status
+is necessarily `NOT_EVALUABLE`.
+
 Run the offline scripted capability sweep:
 
 ```bash
@@ -364,6 +417,24 @@ explicitly (for example, `--max-failure-rate 0.01`). Failed episodes are
 reported but never enter the paired return comparison; only prompt/repeat keys
 usable for every declared model are compared.
 
+The required pre-launch benchmark smoke is five prompts by two responses:
+
+```bash
+python resources_servers/openair_congestion/model_sweep.py \
+  --benchmark-smoke \
+  --models /absolute/path/run1b_models.json \
+  --concurrency 4 \
+  --max-failure-rate 0 \
+  --out /absolute/path/run1b_smoke_raw.json
+```
+
+`--benchmark-smoke` freezes both the `5 x 2` shape and the full Run 1B
+sampling/seed/tool-choice contract. At that size, zero infrastructure, parse,
+and invalid-call failures plus the scripted anchor checks are engineering
+gates. Model-quality inference is deliberately `NOT_EVALUABLE`, because each
+regime has only one prompt cluster. Do not describe a smoke as a model-ordering
+pass.
+
 For the contribution-guide minimum profile, declare at least a smaller and a frontier-equivalent model with unique increasing `capability_rank` values in the model spec, then run:
 
 ```bash
@@ -384,6 +455,42 @@ strict Qwen3-1.7B/Qwen3-8B run is summarized in
 is not a frontier model. Run and attach a passing report from the intended
 small and frontier endpoints before claiming the model-capability gate has
 passed.
+
+The full `500 x 16` command is allowed only after both learned models pass the
+raw tool smoke and the `5 x 2` engineering smoke with zero failures. Running
+the full support with Qwen3-1.7B and Qwen3-8B tests that particular local-model
+ladder; it does not turn Qwen3-8B into a frontier model or establish a
+small-to-frontier contribution-guide claim.
+
+### Package a sweep receipt
+
+`model_sweep_report.py` independently validates the raw report and writes the
+review package rather than trusting rounded console output:
+
+```bash
+python resources_servers/openair_congestion/model_sweep_report.py \
+  --raw-report /absolute/path/run1b_raw.json \
+  --metadata /absolute/path/run1b_metadata.json \
+  --out /absolute/path/run1b_<UTC>_<shortcommit>
+sha256sum -c /absolute/path/run1b_<UTC>_<shortcommit>/SHA256SUMS
+```
+
+The credential-free metadata object must bind the run ID, exact clean source
+commit, causal `replay` backend, raw sampling contract, served and repository
+model identities/revisions, model and tokenizer hashes when available, task,
+tool, reward, dynamics, and renderer SHA-256 values, host/GPU/runtime identity,
+container image digest and signature status, exact commands and exit codes,
+UTC interval, and a sanitized run log. The reporter rejects credential-like
+keys and values.
+
+The output contains `benchmark_contract.json`, `models.json`, the immutable
+raw report, per-episode JSONL, JSON/CSV summaries, prompt-cluster paired deltas,
+PNG/SVG graphs, environment metadata, the run log, and sorted `SHA256SUMS`.
+Inference resamples prompt clusters within regime with fixed seeds (50,000
+draws in the full profile), rather than incorrectly treating the sixteen
+responses from one prompt as independent. A model that misses complete support
+or has any infrastructure, parse, or invalid-call failure is visibly
+`NOT_EVALUABLE`; it is never assigned score zero or silently omitted.
 
 Generate a deterministic, derived-oracle single-intervention benchmark:
 
