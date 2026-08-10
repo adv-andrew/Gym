@@ -43,9 +43,9 @@ parseable call the environment rejects as an unknown tool is counted as
 invalid; and a dead endpoint drops the episode as an infrastructure error.
 Dropped episodes are drained server-side, so one model's failures never starve
 the pool for the next. Unparseable replies are never upgraded to valid noops.
-Generic exploratory sweeps may omit ``chat_template_kwargs``. The named Run 1B
-smoke and compliance profiles require Qwen3 thinking to be explicitly disabled
-so its tool-only 512-token budget cannot be consumed by hidden reasoning before
+Generic exploratory sweeps may omit ``chat_template_kwargs``. Every endpoint in
+a named Run 1B smoke or compliance profile must explicitly disable thinking so
+the tool-only 512-token budget cannot be consumed by hidden reasoning before
 the native tool call.
 
 Usage:
@@ -70,6 +70,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
+from urllib.parse import urlsplit
 
 import aiohttp
 import numpy as np
@@ -99,9 +100,10 @@ _RUN1B_MAX_TOKENS = 512
 _MAX_MODEL_OUTPUT_TOKENS = 512
 _PAIR_KEY = re.compile(r"^(0|[1-9][0-9]*):(0|[1-9][0-9]*)$")
 _REQUEST_SEED_VERSION = "run1b-request-v1"
-_REQUEST_SEED_DERIVATION = (
-    "sha256(run1b-request-v1:{prompt_index}:{response_index}:{step_index}) mod 2**31"
-)
+_REQUEST_SEED_DERIVATION = "sha256(run1b-request-v1:{prompt_index}:{response_index}:{step_index}) mod 2**31"
+_REQUEST_CAPTURE_SCHEMA = "openair.run1b.request-capture.v1"
+_RUN1B_CAPTURE_STEPS = 16
+_RUN1B_LOCAL_BASE_URL = re.compile(r"http://127\.0\.0\.1:([1-9][0-9]{0,4})/v1")
 
 
 def _load_example_rows(path: Path = _EXAMPLE_JSONL) -> list[dict[str, Any]]:
@@ -342,32 +344,180 @@ class ModelSpec:
             or not 1 <= self.max_tokens <= _MAX_MODEL_OUTPUT_TOKENS
         ):
             raise ValueError(
-                f"max_tokens must be an integer between 1 and {_MAX_MODEL_OUTPUT_TOKENS}, "
-                f"got {self.max_tokens!r}"
+                f"max_tokens must be an integer between 1 and {_MAX_MODEL_OUTPUT_TOKENS}, got {self.max_tokens!r}"
             )
         if self.capability_rank is not None and (
             isinstance(self.capability_rank, bool)
             or not isinstance(self.capability_rank, int)
             or self.capability_rank < 1
         ):
-            raise ValueError(
-                f"capability_rank must be a positive integer when provided, got {self.capability_rank!r}"
-            )
+            raise ValueError(f"capability_rank must be a positive integer when provided, got {self.capability_rank!r}")
         if self.chat_template_kwargs is not None:
             if (
                 not isinstance(self.chat_template_kwargs, dict)
                 or set(self.chat_template_kwargs) != {"enable_thinking"}
                 or not isinstance(self.chat_template_kwargs.get("enable_thinking"), bool)
             ):
-                raise ValueError(
-                    "chat_template_kwargs must be omitted or exactly "
-                    "{'enable_thinking': <boolean>}"
-                )
+                raise ValueError("chat_template_kwargs must be omitted or exactly {'enable_thinking': <boolean>}")
             # Do not retain a caller-owned mutable mapping that could change
             # after validation and silently alter later model requests.
-            self.chat_template_kwargs = {
-                "enable_thinking": self.chat_template_kwargs["enable_thinking"]
-            }
+            self.chat_template_kwargs = {"enable_thinking": self.chat_template_kwargs["enable_thinking"]}
+
+
+class _RequestCapture:
+    """Capture exact prelaunch request payloads while excluding HTTP headers."""
+
+    def __init__(
+        self,
+        path: Path,
+        specs: list[ModelSpec],
+        *,
+        prompt_count: int,
+        responses_per_prompt: int,
+        steps_per_episode: int,
+    ) -> None:
+        dimensions = {
+            "prompt_count": prompt_count,
+            "responses_per_prompt": responses_per_prompt,
+            "steps_per_episode": steps_per_episode,
+        }
+        for name, value in dimensions.items():
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"request capture {name} must be a positive integer")
+        identities = [(spec.label, spec.model, spec.capability_rank) for spec in specs]
+        if len(identities) != len(set(identities)):
+            raise ValueError("request capture model identities must be unique")
+
+        self.path = path.expanduser()
+        if not self.path.parent.is_dir():
+            raise FileNotFoundError(f"request capture receipt directory does not exist: {self.path.parent}")
+        if os.path.lexists(self.path):
+            raise FileExistsError(f"request capture destination already exists: {self.path}")
+        # Keep incomplete work visibly separate from the final receipt. The
+        # partial is exclusive-created in the destination directory so a stale
+        # or concurrent attempt cannot be overwritten.
+        self.partial_path = self.path.with_name(f"{self.path.name}.partial")
+        self._output = self.partial_path.open("x", encoding="utf-8", newline="\n")
+        self._specs = list(specs)
+        self._model_indexes = {identity: index for index, identity in enumerate(identities)}
+        self._prompt_count = prompt_count
+        self._responses_per_prompt = responses_per_prompt
+        self._steps_per_episode = steps_per_episode
+        self._records: dict[tuple[int, int, int, int], dict[str, Any]] = {}
+        self._finalized = False
+
+    @staticmethod
+    def _canonical_bytes(value: Any) -> bytes:
+        return json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+
+    def record(
+        self,
+        spec: ModelSpec,
+        row: dict[str, Any],
+        *,
+        step_idx: int,
+        url: str,
+        payload: dict[str, Any],
+    ) -> None:
+        if self._finalized:
+            raise ValueError("request capture is already finalized")
+        identity = (spec.label, spec.model, spec.capability_rank)
+        model_index = self._model_indexes.get(identity)
+        if model_index is None:
+            raise ValueError(f"request capture saw an undeclared model: {identity!r}")
+        prompt_index = row.get("_profile_prompt_index")
+        response_index = row.get("_profile_response_index")
+        coordinates = (prompt_index, response_index, step_idx)
+        limits = (
+            self._prompt_count,
+            self._responses_per_prompt,
+            self._steps_per_episode,
+        )
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0 or value >= limit
+            for value, limit in zip(coordinates, limits, strict=True)
+        ):
+            raise ValueError(f"request capture saw an unexpected prompt/response/step coordinate: {coordinates!r}")
+        key = (model_index, prompt_index, response_index, step_idx)
+        if key in self._records:
+            raise ValueError(f"duplicate request capture coordinate: {key!r}")
+        parsed_url = urlsplit(url)
+        if (
+            parsed_url.username is not None
+            or parsed_url.password is not None
+            or parsed_url.query
+            or parsed_url.fragment
+        ):
+            raise ValueError("request capture URL must not contain credentials, a query, or a fragment")
+
+        canonical_payload = self._canonical_bytes(payload)
+        payload_copy = json.loads(canonical_payload)
+        self._records[key] = {
+            "schema": _REQUEST_CAPTURE_SCHEMA,
+            "model": {
+                "label": spec.label,
+                "served_model_id": spec.model,
+                "capability_rank": spec.capability_rank,
+            },
+            "coordinates": {
+                "prompt_index": prompt_index,
+                "response_index": response_index,
+                "step_index": step_idx,
+            },
+            "url": url,
+            "payload": payload_copy,
+            "canonical_payload_sha256": hashlib.sha256(canonical_payload).hexdigest(),
+        }
+
+    def finalize(self) -> None:
+        if self._finalized:
+            raise ValueError("request capture is already finalized")
+        expected = [
+            (model_index, prompt_index, response_index, step_index)
+            for model_index in range(len(self._specs))
+            for prompt_index in range(self._prompt_count)
+            for response_index in range(self._responses_per_prompt)
+            for step_index in range(self._steps_per_episode)
+        ]
+        missing = [key for key in expected if key not in self._records]
+        unexpected = sorted(set(self._records) - set(expected))
+        if missing or unexpected:
+            raise ValueError(f"request capture is incomplete: missing={len(missing)}, unexpected={len(unexpected)}")
+        if self._output.closed:
+            raise ValueError("request capture destination closed before finalization")
+        if self._output.tell() != 0 or self.partial_path.stat().st_size != 0:
+            raise ValueError("request capture partial changed after exclusive create")
+        serialized = "".join(self._canonical_bytes(self._records[key]).decode("utf-8") + "\n" for key in expected)
+        self._output.write(serialized)
+        self._output.flush()
+        os.fsync(self._output.fileno())
+        self._output.close()
+        if len(self.partial_path.read_text(encoding="utf-8").splitlines()) != len(expected):
+            raise ValueError("request capture JSONL row count changed during finalization")
+        # Hard-link publication is atomic and refuses to replace a final path
+        # created while the smoke was running. Both names are in one directory,
+        # so a successful link exposes only the already-fsynced complete inode.
+        os.link(self.partial_path, self.path)
+        self.partial_path.unlink()
+        self._finalized = True
+
+    def abort(self) -> None:
+        """Close an unfinished capture while retaining its .partial evidence."""
+
+        if self._output.closed:
+            return
+        try:
+            self._output.close()
+        except OSError:
+            # Preserve the original sweep exception. The clearly named partial
+            # remains fail-closed even if the filesystem also rejects close.
+            pass
 
 
 def _require_ranked_models(specs: list[ModelSpec], profile_name: str) -> None:
@@ -394,6 +544,17 @@ def _require_compliance_models(specs: list[ModelSpec]) -> None:
 def _require_run1b_sampling(specs: list[ModelSpec]) -> None:
     expected = (_RUN1B_TEMPERATURE, _RUN1B_TOP_P, _RUN1B_MAX_TOKENS)
     for spec in specs:
+        if spec.api_key_env:
+            raise ValueError(
+                "Run 1B named profiles require unauthenticated local loopback model endpoints; "
+                f"model {spec.label!r} declared api_key_env={spec.api_key_env!r}"
+            )
+        endpoint = _RUN1B_LOCAL_BASE_URL.fullmatch(spec.base_url)
+        if endpoint is None or int(endpoint.group(1)) > 65_535:
+            raise ValueError(
+                "Run 1B named profiles require base_url exactly "
+                f"http://127.0.0.1:<port>/v1 with port 1-65535; model {spec.label!r} declared {spec.base_url!r}"
+            )
         observed = (float(spec.temperature), float(spec.top_p), spec.max_tokens)
         if observed != expected:
             raise ValueError(
@@ -592,10 +753,7 @@ def _clustered_paired_summary(
             raise ValueError("paired deltas must be finite")
         clusters.setdefault((scenario_id, prompt_index), []).append(value)
 
-    cluster_means = {
-        key: statistics.fmean(values)
-        for key, values in clusters.items()
-    }
+    cluster_means = {key: statistics.fmean(values) for key, values in clusters.items()}
     strata: dict[str, list[float]] = {}
     for (scenario_id, _prompt_index), value in sorted(cluster_means.items()):
         strata.setdefault(scenario_id, []).append(value)
@@ -806,7 +964,13 @@ def _request_seed(row: dict[str, Any], step_idx: int) -> int:
 
 
 async def _llm_action(
-    session: aiohttp.ClientSession, spec: ModelSpec, row: dict, observation: str, step_idx: int
+    session: aiohttp.ClientSession,
+    spec: ModelSpec,
+    row: dict,
+    observation: str,
+    step_idx: int,
+    *,
+    request_capture: _RequestCapture | None = None,
 ) -> dict[str, Any] | None:
     # The row's own input messages (system prompt + task prompt), then the
     # current rendered observation. Single-turn on purpose: each step stands
@@ -838,8 +1002,17 @@ async def _llm_action(
     }
     if spec.chat_template_kwargs is not None:
         payload["chat_template_kwargs"] = dict(spec.chat_template_kwargs)
+    url = f"{spec.base_url.rstrip('/')}/chat/completions"
+    if request_capture is not None:
+        request_capture.record(
+            spec,
+            row,
+            step_idx=step_idx,
+            url=url,
+            payload=payload,
+        )
     async with session.post(
-        f"{spec.base_url.rstrip('/')}/chat/completions",
+        url,
         json=payload,
         headers=headers,
         timeout=aiohttp.ClientTimeout(total=90),
@@ -1072,13 +1245,10 @@ def _evaluate_model_ordering(
     paired_returns: dict[str, dict[str, float]] = {}
     for label in expected:
         paired_records[label] = {
-            pair_key: record
-            for pair_key, record in all_records_by_label[label].items()
-            if record["usable"] is True
+            pair_key: record for pair_key, record in all_records_by_label[label].items() if record["usable"] is True
         }
         paired_returns[label] = {
-            pair_key: float(record["return"])
-            for pair_key, record in paired_records[label].items()
+            pair_key: float(record["return"]) for pair_key, record in paired_records[label].items()
         }
 
     reference_keys = set.intersection(*(set(paired_returns[label]) for label in expected))
@@ -1107,10 +1277,7 @@ def _evaluate_model_ordering(
     sorted_keys = sorted(reference_keys)
     pair_coordinates: dict[str, tuple[int, int, str]] = {}
     for pair_key in sorted_keys:
-        coordinates = {
-            _record_pair_coordinates(paired_records[label][pair_key])
-            for label in expected
-        }
+        coordinates = {_record_pair_coordinates(paired_records[label][pair_key]) for label in expected}
         if len(coordinates) != 1:
             return {
                 "status": "NOT_EVALUABLE",
@@ -1129,9 +1296,7 @@ def _evaluate_model_ordering(
     for prompt_index, _response_index, scenario_id in pair_coordinates.values():
         prompt_clusters_by_scenario.setdefault(scenario_id, set()).add(prompt_index)
     underpowered_scenarios = sorted(
-        scenario_id
-        for scenario_id, prompt_indices in prompt_clusters_by_scenario.items()
-        if len(prompt_indices) < 2
+        scenario_id for scenario_id, prompt_indices in prompt_clusters_by_scenario.items() if len(prompt_indices) < 2
     )
     if underpowered_scenarios:
         return {
@@ -1205,6 +1370,7 @@ async def _sweep(
     compliance_profile: bool = False,
     run1b_profile: bool = False,
     failure_rate_ceiling: float = 0.0,
+    request_capture_out: Path | None = None,
 ) -> dict[str, Any]:
     if repeats < 1:
         raise ValueError(f"repeats must be >= 1, got {repeats}")
@@ -1216,6 +1382,11 @@ async def _sweep(
         raise ValueError(f"failure_rate_ceiling must be a finite number between 0 and 1, got {failure_rate_ceiling!r}")
     if compliance_profile and failure_rate_ceiling != 0.0:
         raise ValueError("compliance profiles require failure_rate_ceiling=0")
+    if compliance_profile and request_capture_out is not None:
+        raise ValueError(
+            "request capture is forbidden for compliance profiles; "
+            "bind the passed prelaunch capture receipts externally"
+        )
     if compliance_profile:
         run1b_profile = True
     labels = [spec.label for spec in specs]
@@ -1254,36 +1425,73 @@ async def _sweep(
         for response_index in range(repeats)
     }
     _validate_pair_manifest(expected_pair_manifest, expected_episodes=len(task_rows) * repeats)
-    base_url = _start_local_server()
-    rows = _repeat_task_rows(task_rows, repeats)
-    results: dict[str, PolicyStats] = {}
-    semaphore = asyncio.Semaphore(concurrency)
+    request_capture = None
+    if request_capture_out is not None:
+        if not specs:
+            raise ValueError("request capture requires at least one model")
+        bad_step_rows = [
+            index
+            for index, row in enumerate(task_rows)
+            if isinstance(row.get("max_steps", 16), bool)
+            or not isinstance(row.get("max_steps", 16), int)
+            or row.get("max_steps", 16) != _RUN1B_CAPTURE_STEPS
+        ]
+        if bad_step_rows:
+            raise ValueError(
+                f"request capture requires max_steps=16 for every task row; invalid row indexes: {bad_step_rows}"
+            )
+        request_capture = _RequestCapture(
+            request_capture_out,
+            specs,
+            prompt_count=len(task_rows),
+            responses_per_prompt=repeats,
+            steps_per_episode=_RUN1B_CAPTURE_STEPS,
+        )
 
-    for label, factory in _ANCHORS.items():
-        stats = results[label] = PolicyStats()
+    try:
+        base_url = _start_local_server()
+        rows = _repeat_task_rows(task_rows, repeats)
+        results: dict[str, PolicyStats] = {}
+        semaphore = asyncio.Semaphore(concurrency)
 
-        async def run_anchor(row: dict[str, Any]) -> None:
-            rng_seed = int(row["seed"]) * 1_000_003 + int(row["_profile_response_index"])
-            action_fn = functools.partial(_scripted_action, factory(), random.Random(rng_seed))
-            async with semaphore:
-                await _run_episode(base_url, row, action_fn, stats)
+        for label, factory in _ANCHORS.items():
+            stats = results[label] = PolicyStats()
 
-        await asyncio.gather(*(run_anchor(row) for row in rows))
-
-    for spec in specs:
-        stats = results[f"model:{spec.label}"] = PolicyStats()
-
-        async def run_model(row: dict[str, Any], llm_session: aiohttp.ClientSession) -> None:
-            async with semaphore:
-                action_fn = functools.partial(_llm_action, llm_session, spec, row)
-                try:
+            async def run_anchor(row: dict[str, Any]) -> None:
+                rng_seed = int(row["seed"]) * 1_000_003 + int(row["_profile_response_index"])
+                action_fn = functools.partial(_scripted_action, factory(), random.Random(rng_seed))
+                async with semaphore:
                     await _run_episode(base_url, row, action_fn, stats)
-                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                    stats.infra_errors += 1
-                    print(f"model:{spec.label} seed={row['seed']}: episode dropped ({type(e).__name__}: {e})")
 
-        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=concurrency)) as llm_session:
-            await asyncio.gather(*(run_model(row, llm_session) for row in rows))
+            await asyncio.gather(*(run_anchor(row) for row in rows))
+
+        for spec in specs:
+            stats = results[f"model:{spec.label}"] = PolicyStats()
+
+            async def run_model(row: dict[str, Any], llm_session: aiohttp.ClientSession) -> None:
+                async with semaphore:
+                    action_fn = functools.partial(
+                        _llm_action,
+                        llm_session,
+                        spec,
+                        row,
+                        request_capture=request_capture,
+                    )
+                    try:
+                        await _run_episode(base_url, row, action_fn, stats)
+                    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                        stats.infra_errors += 1
+                        print(f"model:{spec.label} seed={row['seed']}: episode dropped ({type(e).__name__}: {e})")
+
+            async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=concurrency)) as llm_session:
+                await asyncio.gather(*(run_model(row, llm_session) for row in rows))
+
+        if request_capture is not None:
+            request_capture.finalize()
+    except BaseException:
+        if request_capture is not None:
+            request_capture.abort()
+        raise
 
     relief_mean = results["anchor:relief"].row("anchor:relief")["mean_return"]
     if relief_mean is None:
@@ -1339,9 +1547,7 @@ async def _sweep(
                 "status": "PASS" if passed else "FAIL",
             }
         )
-    ordered = anchor_engineering_ok and all(
-        comparison["status"] == "PASS" for comparison in anchor_comparisons
-    )
+    ordered = anchor_engineering_ok and all(comparison["status"] == "PASS" for comparison in anchor_comparisons)
     model_ordering = _evaluate_model_ordering(
         table,
         specs,
@@ -1361,9 +1567,7 @@ async def _sweep(
             "tool_choice": "required",
             "parallel_tool_calls": False,
             "chat_template_kwargs": (
-                dict(specs[0].chat_template_kwargs)
-                if specs[0].chat_template_kwargs is not None
-                else None
+                dict(specs[0].chat_template_kwargs) if specs[0].chat_template_kwargs is not None else None
             ),
         }
     return {
@@ -1450,7 +1654,7 @@ def _model_gate_satisfied(model_ordering: Mapping[str, Any], *, configured_model
     )
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--models", help="JSON file with a list of model specs (see sweep_models.example.json)")
     parser.add_argument("--task-count", type=int, default=5, help="number of deterministic prompts (default 5)")
@@ -1478,8 +1682,29 @@ def main() -> None:
         default=0.0,
         help=("maximum parse/invalid/infrastructure failure fraction per model outside compliance mode (default 0)"),
     )
+    parser.add_argument(
+        "--request-capture-out",
+        type=Path,
+        help=(
+            "JSONL path for exact model request payloads (HTTP headers excluded); "
+            "named Run 1B profiles require unauthenticated local loopback endpoints; "
+            "required by --engineering-smoke and --benchmark-smoke"
+        ),
+    )
     parser.add_argument("--out", help="write the full report as JSON to this path")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.request_capture_out is not None and args.out is not None:
+        capture_path = args.request_capture_out.expanduser().resolve(strict=False)
+        report_path = Path(args.out).expanduser().resolve(strict=False)
+        if capture_path == report_path:
+            parser.error("--request-capture-out and --out must resolve to different files")
+    if (args.engineering_smoke or args.benchmark_smoke) and args.request_capture_out is None:
+        parser.error("--request-capture-out is required for --engineering-smoke and --benchmark-smoke")
+    if args.compliance_profile and args.request_capture_out is not None:
+        parser.error(
+            "--request-capture-out is forbidden with --compliance-profile; "
+            "bind the passed prelaunch capture receipts externally"
+        )
 
     specs = []
     if args.models:
@@ -1508,7 +1733,9 @@ def main() -> None:
             if args.benchmark_smoke
             else args.task_count
         )
-        repeats = 16 if args.compliance_profile else 2 if (args.engineering_smoke or args.benchmark_smoke) else args.repeats
+        repeats = (
+            16 if args.compliance_profile else 2 if (args.engineering_smoke or args.benchmark_smoke) else args.repeats
+        )
         task_rows = _profile_task_rows(base_rows, task_count)
         report = asyncio.run(
             _sweep(
@@ -1519,6 +1746,7 @@ def main() -> None:
                 compliance_profile=args.compliance_profile,
                 run1b_profile=args.engineering_smoke or args.benchmark_smoke,
                 failure_rate_ceiling=args.max_failure_rate,
+                request_capture_out=args.request_capture_out,
             )
         )
     except ValueError as e:

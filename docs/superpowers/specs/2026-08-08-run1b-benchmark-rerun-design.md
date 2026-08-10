@@ -16,10 +16,11 @@ with at least two locally served learned models under the same prompt, tool,
 sampling, and environment contracts. Produce a graph and a complete receipt
 package without ranking a model that fails the engineering gate.
 
-The immediately available, no-credential ladder is Qwen3-1.7B and Qwen3-8B.
-Neither is called a frontier model. Thinking Machines Inkling is out of scope
-for this run because no compatible local artifact or approved endpoint is
-available.
+The sweep implementation is model-count agnostic; the current prelaunch
+manifest contains four ordered model specs. The locally available
+Qwen3-1.7B/Qwen3-8B pair remains a useful no-credential subset, but neither is
+called a frontier model. Thinking Machines Inkling is out of scope for this
+run because no compatible local artifact or approved endpoint is available.
 
 ## Frozen experiment contract
 
@@ -36,14 +37,20 @@ available.
   top-p, maximum output tokens, required single-tool-call policy, and
   pair-derived request seeds.
 - Every named profile sends `chat_template_kwargs={"enable_thinking": false}`
-  natively to both Qwen3 endpoints. Generic sweeps may omit this field, but a
-  Run 1B engineering smoke, benchmark smoke, or compliance run may not. The
-  H100 tool-path smoke showed that thinking can exhaust the 512-token
-  tool-only budget before a native call, so omission is not equivalent to the
-  frozen contract.
+  natively to every declared model endpoint. Generic sweeps may omit this
+  field, but a Run 1B engineering smoke, benchmark smoke, or compliance run
+  may not. The H100 tool-path smoke showed that thinking can exhaust the
+  512-token tool-only budget before a native call, so omission is not
+  equivalent to the frozen contract.
 - vLLM is launched with its framework defaults instead of mutable model
   `generation_config.json` overrides; engine and parser settings are recorded.
 - Scripted anchors and learned models use the same prompt/repeat support.
+- The engineering and benchmark smokes require a request-capture path. For
+  these named Run 1B profiles, exact unauthenticated loopback endpoints and
+  the frozen synthetic inputs make the captured URL and JSON payload
+  credential-free by contract. Full compliance forbids request capture so the
+  512,000-request lattice cannot become an in-memory launch hazard; its receipt
+  binds the passed prelaunch captures instead.
 
 ## Gates
 
@@ -51,12 +58,14 @@ The launch sequence is fail-closed:
 
 1. Local CPU tests pass on the exact source to transfer.
 2. Model servers report the expected model IDs and revisions.
-3. Request capture confirms identical sampling, seed derivation, and explicit
-   `enable_thinking=false` chat-template kwargs for both models.
-4. A one-prompt/two-response tool-call smoke completes for both models with no
-   infrastructure, parse, or invalid-call failures.
+3. A one-prompt/two-response tool-call smoke completes for every declared
+   model with no infrastructure, parse, or invalid-call failures. Its request
+   capture must contain the complete expected lattice.
+4. Request-capture validation confirms identical sampling, seed derivation,
+   and explicit `enable_thinking=false` chat-template kwargs across models.
 5. A five-prompt/two-response benchmark smoke passes every scripted anchor
-   constraint and both model engineering gates.
+   constraint and every model engineering gate, again with a complete request
+   capture.
 6. Only then may the 500 by 16 profile run.
 
 The full engineering gate requires the complete planned pair support for every
@@ -71,6 +80,46 @@ noop over catastrophic, and random-valid over catastrophic.
 The model-quality gate applies only after the engineering gate. Every adjacent
 higher-ranked model must have a positive paired prompt-cluster mean delta and a
 positive 95% lower bound.
+
+## Request-capture contract
+
+`--request-capture-out` is mandatory for `--engineering-smoke` and
+`--benchmark-smoke`. It remains optional for generic exploratory sweeps and is
+rejected with `--compliance-profile`. The destination's parent receipt
+directory must already exist. The resolved capture and report paths must be
+different. A same-directory `<destination>.partial` file is opened with
+exclusive creation before model traffic, and the final destination must not
+already exist. Either existing path fails the run instead of being overwritten.
+
+After the complete lattice validates, the implementation writes, flushes,
+fsyncs, and closes the partial before atomically publishing it through a
+same-directory hard link that cannot replace a racing final path. It then
+removes the partial name. On any `BaseException` before successful publication,
+the implementation publishes no new final, closes and retains the clearly
+named partial as incomplete evidence, and leaves any pre-existing or racing
+final untouched.
+
+The capture records every payload actually constructed for a model request,
+not one representative payload per model. With the current four-model
+manifest and the fixed 16-step horizon, the exact cardinalities are:
+
+- engineering: `4 models x 1 prompt x 2 responses x 16 steps = 128` rows;
+- benchmark: `4 models x 5 prompts x 2 responses x 16 steps = 640` rows.
+
+Rows are serialized in deterministic model-spec, prompt, response, then step
+order regardless of asynchronous completion order. Each row contains schema
+version, model label/served ID/capability rank, all three integer coordinates,
+the request URL, the exact constructed JSON payload, and the SHA-256 of that
+payload's canonical JSON (`sort_keys=true`, compact separators, UTF-8,
+non-finite numbers rejected). HTTP headers are never captured. Generic
+exploratory capture does not promise that caller-supplied URLs or payloads are
+secret-free, so callers must not place secrets there. Every named Run 1B
+profile is stricter: every model must have no `api_key_env` and must use exactly
+`http://127.0.0.1:<port>/v1`, with a decimal port from 1 through 65535. This
+excludes URL user information, query strings, fragments, non-loopback hosts,
+and TLS endpoints from the named profile. A duplicate, out-of-range, missing,
+or unexpected coordinate fails the run; validation happens before a complete
+capture is finalized.
 
 ## Statistical unit
 
@@ -109,7 +158,29 @@ run1b_<UTC>_<shortcommit>/
 `environment.json` records source and dirty status, exact commands and exit
 codes, host/GPU identity, model and tokenizer revisions or hashes, container or
 runtime identities, decoding settings, seeds, reward/dynamics identity, and
-start/end UTC. Credentials are never written.
+start/end UTC. Under the named Run 1B endpoint and frozen-input contract, no
+credential is written to the package.
+
+The strict reporter package above stays unchanged. The final custody handoff
+wraps it with the raw full receipt and both prelaunch receipts:
+
+```text
+run1b_qwen4_handoff/
+  prelaunch/
+    engineering_smoke/       # includes request_capture.jsonl + SHA256SUMS
+    benchmark_smoke/         # includes request_capture.jsonl + SHA256SUMS
+  full_profile/              # raw compliance receipt; no request capture
+  validation/                # verifier output and validator digest
+  package_inputs/metadata.json
+  package/                   # strict reporter output shown above
+  HANDOFF_MANIFEST.json
+  OUTER_SHA256SUMS
+```
+
+A full-profile request capture is forbidden rather than a launch gate. The
+full verifier requires both passed prelaunch capture receipts and proves that
+they share the same source, model configuration, serving image, prompt/tool,
+sampling, and environment identities before the outer archive is sealed.
 
 The graph consumes only validated report data. Failed models are visibly
 marked `NOT EVALUABLE`, never converted to score zero. Historical T1, Run B,

@@ -19,8 +19,10 @@
 # path runs end-to-end against a stub chat-completions server, so request
 # shape, parsing, and failure accounting are covered without a network.
 import asyncio
+import hashlib
 import json
 import random
+from pathlib import Path
 
 import pytest
 from aiohttp import web
@@ -39,10 +41,55 @@ from resources_servers.openair_congestion.model_sweep import (
     _parse_topology,
     _profile_task_rows,
     _repeat_task_rows,
+    _RequestCapture,
     _require_compliance_models,
     _sweep,
     _validate_compliance_rows,
+    main,
 )
+
+
+def _capture_response():
+    class Response:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        async def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [{"function": {"name": "noop", "arguments": "{}"}}],
+                            "content": None,
+                        }
+                    }
+                ]
+            }
+
+    return Response()
+
+
+class _CaptureSession:
+    def __init__(self):
+        self.payloads = []
+        self.headers = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+    def post(self, url, *, json, headers, timeout):
+        self.payloads.append((url, json))
+        self.headers.append(headers)
+        return _capture_response()
 
 
 def _free_port():
@@ -457,8 +504,7 @@ def test_singleton_regime_smoke_is_engineering_only_not_a_quality_pass():
     scenarios = ("prb_exhaustion", "bursty", "interference", "prach_storm", "qos_competition")
     manifest = _pair_manifest(*scenarios)
     weak = [
-        _episode_record(prompt_index, 0, scenario_id=scenario_id)
-        for prompt_index, scenario_id in enumerate(scenarios)
+        _episode_record(prompt_index, 0, scenario_id=scenario_id) for prompt_index, scenario_id in enumerate(scenarios)
     ]
     strong = [{**record, "return": 1.0} for record in weak]
 
@@ -689,10 +735,7 @@ def test_positive_mean_with_interval_crossing_zero_fails():
     ]
     deltas = [-0.1, 0.1, 0.1, -0.05]
     weak_records = [_episode_record(index, 0) for index in range(len(deltas))]
-    strong_records = [
-        _episode_record(index, 0, episode_return=delta)
-        for index, delta in enumerate(deltas)
-    ]
+    strong_records = [_episode_record(index, 0, episode_return=delta) for index, delta in enumerate(deltas)]
     profile = [_profile_row("small", weak_records), _profile_row("frontier", strong_records)]
     manifest = _pair_manifest(*(tuple("bursty" for _ in deltas)))
 
@@ -814,6 +857,557 @@ def test_model_spec_rejects_unsafe_top_p(top_p):
         ModelSpec(label="model", model="model", base_url="http://x", top_p=top_p)
 
 
+@pytest.mark.parametrize("prompt_count, expected_rows", [(1, 128), (5, 640)])
+def test_request_capture_records_every_prelaunch_payload_in_deterministic_order(
+    tmp_path: Path, monkeypatch, prompt_count: int, expected_rows: int
+):
+    monkeypatch.setenv("CAPTURE_TEST_KEY", "credential-must-not-appear")
+    specs = [
+        ModelSpec(
+            label=f"model-{index}",
+            model=f"qwen3-model-{index}",
+            base_url=f"http://127.0.0.1:{18001 + index}/v1",
+            api_key_env="CAPTURE_TEST_KEY",
+            chat_template_kwargs={"enable_thinking": False},
+            capability_rank=index + 1,
+        )
+        for index in range(4)
+    ]
+    capture_path = tmp_path / "requests.jsonl"
+    capture = _RequestCapture(
+        capture_path,
+        specs,
+        prompt_count=prompt_count,
+        responses_per_prompt=2,
+        steps_per_episode=16,
+    )
+    session = _CaptureSession()
+    prompts = _profile_task_rows(_load_example_rows(), task_count=prompt_count)
+
+    async def capture_all():
+        for spec in specs:
+            for prompt in prompts:
+                for response_index in range(2):
+                    row = json.loads(json.dumps(prompt))
+                    row["_profile_response_index"] = response_index
+                    for step_index in range(16):
+                        action = await _llm_action(
+                            session,
+                            spec,
+                            row,
+                            f"- Cell 0: observation {response_index}:{step_index}",
+                            step_idx=step_index,
+                            request_capture=capture,
+                        )
+                        assert action == {"name": "noop", "arguments": {}}
+
+    asyncio.run(capture_all())
+    capture.finalize()
+
+    lines = capture_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == expected_rows
+    records = [json.loads(line) for line in lines]
+    rows_per_model = prompt_count * 2 * 16
+    assert [record["model"]["label"] for record in records] == [
+        spec.label for spec in specs for _ in range(rows_per_model)
+    ]
+    for index, record in enumerate(records):
+        spec = specs[index // rows_per_model]
+        coordinate_offset = index % rows_per_model
+        prompt_index = coordinate_offset // 32
+        prompt_offset = coordinate_offset % 32
+        assert set(record) == {
+            "schema",
+            "model",
+            "coordinates",
+            "url",
+            "payload",
+            "canonical_payload_sha256",
+        }
+        assert record["schema"] == "openair.run1b.request-capture.v1"
+        assert record["model"] == {
+            "label": spec.label,
+            "served_model_id": spec.model,
+            "capability_rank": spec.capability_rank,
+        }
+        assert record["coordinates"] == {
+            "prompt_index": prompt_index,
+            "response_index": prompt_offset // 16,
+            "step_index": prompt_offset % 16,
+        }
+        assert record["url"] == f"{spec.base_url}/chat/completions"
+        assert record["payload"] == session.payloads[index][1]
+        canonical = json.dumps(
+            record["payload"],
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        assert record["canonical_payload_sha256"] == hashlib.sha256(canonical).hexdigest()
+    serialized = capture_path.read_text(encoding="utf-8")
+    assert "credential-must-not-appear" not in serialized
+    assert "Authorization" not in serialized
+    assert all(headers == {"Authorization": "Bearer credential-must-not-appear"} for headers in session.headers)
+    with pytest.raises(FileExistsError):
+        _RequestCapture(
+            capture_path,
+            specs,
+            prompt_count=prompt_count,
+            responses_per_prompt=2,
+            steps_per_episode=16,
+        )
+
+
+def test_request_capture_rejects_duplicate_and_missing_target_coordinates(tmp_path: Path):
+    specs = [
+        ModelSpec(label="small", model="small", base_url="http://x", capability_rank=1),
+        ModelSpec(label="large", model="large", base_url="http://x", capability_rank=2),
+    ]
+    row = _profile_task_rows(_load_example_rows(), task_count=1)[0]
+    row["_profile_response_index"] = 0
+    payload = {"model": "small"}
+
+    capture_kwargs = {
+        "prompt_count": 1,
+        "responses_per_prompt": 2,
+        "steps_per_episode": 16,
+    }
+    duplicate = _RequestCapture(tmp_path / "duplicate.jsonl", specs, **capture_kwargs)
+    duplicate.record(
+        specs[0],
+        row,
+        step_idx=0,
+        url="http://x/chat/completions",
+        payload=payload,
+    )
+    with pytest.raises(ValueError, match="duplicate|order"):
+        duplicate.record(
+            specs[0],
+            row,
+            step_idx=0,
+            url="http://x/chat/completions",
+            payload=payload,
+        )
+
+    missing = _RequestCapture(tmp_path / "missing.jsonl", specs, **capture_kwargs)
+    missing.record(
+        specs[0],
+        row,
+        step_idx=0,
+        url="http://x/chat/completions",
+        payload=payload,
+    )
+    with pytest.raises(ValueError, match="missing"):
+        missing.finalize()
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://user:secret@example.invalid/v1/chat/completions",
+        "https://example.invalid/v1/chat/completions?api_key=secret",
+        "https://example.invalid/v1/chat/completions#secret",
+    ],
+)
+def test_request_capture_rejects_urls_that_could_embed_credentials(tmp_path: Path, url: str):
+    spec = ModelSpec(
+        label="model",
+        model="model",
+        base_url="https://example.invalid/v1",
+        capability_rank=1,
+    )
+    row = _profile_task_rows(_load_example_rows(), task_count=1)[0]
+    row["_profile_response_index"] = 0
+    capture = _RequestCapture(
+        tmp_path / f"unsafe-{len(list(tmp_path.iterdir()))}.jsonl",
+        [spec],
+        prompt_count=1,
+        responses_per_prompt=1,
+        steps_per_episode=1,
+    )
+
+    with pytest.raises(ValueError, match="credentials"):
+        capture.record(spec, row, step_idx=0, url=url, payload={"model": "model"})
+
+
+def test_request_capture_requires_existing_receipt_directory(tmp_path: Path):
+    spec = ModelSpec(
+        label="model",
+        model="model",
+        base_url="http://x",
+        capability_rank=1,
+    )
+
+    with pytest.raises(FileNotFoundError):
+        _RequestCapture(
+            tmp_path / "not-created" / "requests.jsonl",
+            [spec],
+            prompt_count=1,
+            responses_per_prompt=1,
+            steps_per_episode=1,
+        )
+
+
+def test_request_capture_publishes_from_partial_without_overwriting_a_racing_final(tmp_path: Path):
+    spec = ModelSpec(
+        label="model",
+        model="model",
+        base_url="http://127.0.0.1:18001/v1",
+        capability_rank=1,
+    )
+    row = _profile_task_rows(_load_example_rows(), task_count=1)[0]
+    row["_profile_response_index"] = 0
+    capture_path = tmp_path / "request_capture.jsonl"
+    partial_path = tmp_path / "request_capture.jsonl.partial"
+    capture = _RequestCapture(
+        capture_path,
+        [spec],
+        prompt_count=1,
+        responses_per_prompt=1,
+        steps_per_episode=1,
+    )
+
+    assert not capture_path.exists()
+    assert partial_path.is_file()
+    capture.record(
+        spec,
+        row,
+        step_idx=0,
+        url="http://127.0.0.1:18001/v1/chat/completions",
+        payload={"model": "model"},
+    )
+    capture_path.write_text("do-not-overwrite\n", encoding="utf-8")
+
+    with pytest.raises(FileExistsError):
+        capture.finalize()
+
+    assert capture_path.read_text(encoding="utf-8") == "do-not-overwrite\n"
+    partial_records = [json.loads(line) for line in partial_path.read_text(encoding="utf-8").splitlines()]
+    assert len(partial_records) == 1
+    assert partial_records[0]["coordinates"] == {
+        "prompt_index": 0,
+        "response_index": 0,
+        "step_index": 0,
+    }
+
+
+def test_sweep_retains_clearly_marked_partial_on_baseexception(tmp_path: Path, monkeypatch):
+    spec = ModelSpec(
+        label="model",
+        model="model",
+        base_url="http://127.0.0.1:18001/v1",
+        chat_template_kwargs={"enable_thinking": False},
+        capability_rank=1,
+    )
+    capture_path = tmp_path / "request_capture.jsonl"
+    partial_path = tmp_path / "request_capture.jsonl.partial"
+
+    def interrupt_server_start():
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(model_sweep_module, "_start_local_server", interrupt_server_start)
+
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(
+            _sweep(
+                _profile_task_rows(_load_example_rows(), 1),
+                repeats=1,
+                specs=[spec],
+                run1b_profile=True,
+                request_capture_out=capture_path,
+            )
+        )
+
+    assert not capture_path.exists()
+    assert partial_path.is_file()
+    assert partial_path.read_bytes() == b""
+
+
+@pytest.mark.parametrize(
+    "profile_flag",
+    ["--engineering-smoke", "--benchmark-smoke"],
+)
+def test_prelaunch_run1b_profiles_require_request_capture_cli_argument(profile_flag):
+    with pytest.raises(SystemExit) as error:
+        main([profile_flag])
+
+    assert error.value.code == 2
+
+
+def test_compliance_profile_may_omit_request_capture(monkeypatch, tmp_path: Path):
+    seen = {}
+    model_path = tmp_path / "models.json"
+    model_path.write_text(
+        json.dumps(
+            [
+                {
+                    "label": "small",
+                    "model": "small",
+                    "base_url": "http://x",
+                    "chat_template_kwargs": {"enable_thinking": False},
+                    "capability_rank": 1,
+                },
+                {
+                    "label": "large",
+                    "model": "large",
+                    "base_url": "http://x",
+                    "chat_template_kwargs": {"enable_thinking": False},
+                    "capability_rank": 2,
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    async def fake_sweep(task_rows, repeats, specs, concurrency, **kwargs):
+        seen.update(kwargs)
+        return {
+            "anchor_ordering_ok": True,
+            "model_ordering": {"status": "PASS"},
+        }
+
+    monkeypatch.setattr(model_sweep_module, "_load_example_rows", lambda: [{"seed": 1}])
+    monkeypatch.setattr(model_sweep_module, "_validate_compliance_rows", lambda rows: None)
+    monkeypatch.setattr(model_sweep_module, "_sweep", fake_sweep)
+    monkeypatch.setattr(model_sweep_module, "_print_report", lambda report: None)
+
+    main(["--compliance-profile", "--models", str(model_path)])
+
+    assert seen["request_capture_out"] is None
+
+
+def test_compliance_profile_rejects_request_capture_cli_argument(tmp_path: Path):
+    with pytest.raises(SystemExit) as error:
+        main(
+            [
+                "--compliance-profile",
+                "--request-capture-out",
+                str(tmp_path / "too-large.jsonl"),
+            ]
+        )
+
+    assert error.value.code == 2
+
+
+def test_compliance_sweep_rejects_request_capture_when_called_directly(tmp_path: Path):
+    specs = [
+        ModelSpec(
+            label="small",
+            model="small",
+            base_url="http://x",
+            chat_template_kwargs={"enable_thinking": False},
+            capability_rank=1,
+        ),
+        ModelSpec(
+            label="large",
+            model="large",
+            base_url="http://x",
+            chat_template_kwargs={"enable_thinking": False},
+            capability_rank=2,
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="forbidden.*compliance"):
+        asyncio.run(
+            _sweep(
+                _profile_task_rows(_load_example_rows(), 1),
+                repeats=1,
+                specs=specs,
+                compliance_profile=True,
+                request_capture_out=tmp_path / "too-large.jsonl",
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("profile_flag", "expected_prompts"),
+    [("--engineering-smoke", 1), ("--benchmark-smoke", 5)],
+)
+def test_prelaunch_cli_passes_capture_path_and_exact_profile_dimensions(
+    tmp_path: Path, monkeypatch, profile_flag: str, expected_prompts: int
+):
+    seen = {}
+    model_path = tmp_path / "models.json"
+    model_path.write_text(
+        json.dumps(
+            [
+                {
+                    "label": f"model-{index}",
+                    "model": f"model-{index}",
+                    "base_url": "http://x",
+                    "chat_template_kwargs": {"enable_thinking": False},
+                    "capability_rank": index + 1,
+                }
+                for index in range(4)
+            ]
+        ),
+        encoding="utf-8",
+    )
+    capture_path = tmp_path / "requests.jsonl"
+
+    async def fake_sweep(task_rows, repeats, specs, concurrency, **kwargs):
+        seen.update(
+            task_rows=task_rows,
+            repeats=repeats,
+            specs=specs,
+            concurrency=concurrency,
+            **kwargs,
+        )
+        return {
+            "anchor_ordering_ok": True,
+            "model_ordering": {"status": "PASS"},
+        }
+
+    monkeypatch.setattr(model_sweep_module, "_sweep", fake_sweep)
+    monkeypatch.setattr(model_sweep_module, "_print_report", lambda report: None)
+
+    main(
+        [
+            profile_flag,
+            "--models",
+            str(model_path),
+            "--request-capture-out",
+            str(capture_path),
+        ]
+    )
+
+    assert len(seen["task_rows"]) == expected_prompts
+    assert seen["repeats"] == 2
+    assert len(seen["specs"]) == 4
+    assert seen["run1b_profile"] is True
+    assert seen["request_capture_out"] == capture_path
+
+
+def test_generic_sweep_cli_remains_backward_compatible_without_capture(monkeypatch):
+    seen = {}
+
+    async def fake_sweep(task_rows, repeats, specs, concurrency, **kwargs):
+        seen.update(kwargs)
+        return {
+            "anchor_ordering_ok": True,
+            "model_ordering": {"status": "NOT_CONFIGURED"},
+        }
+
+    monkeypatch.setattr(model_sweep_module, "_load_example_rows", lambda: [{"seed": 1}])
+    monkeypatch.setattr(model_sweep_module, "_sweep", fake_sweep)
+    monkeypatch.setattr(model_sweep_module, "_print_report", lambda report: None)
+
+    main(["--task-count", "1"])
+
+    assert seen["request_capture_out"] is None
+
+
+def test_prelaunch_cli_rejects_capture_and_report_paths_that_resolve_to_the_same_file(
+    tmp_path: Path, monkeypatch, capsys
+):
+    model_path = tmp_path / "models.json"
+    model_path.write_text(
+        json.dumps(
+            [
+                {
+                    "label": f"model-{index}",
+                    "model": f"model-{index}",
+                    "base_url": f"http://127.0.0.1:{18001 + index}/v1",
+                    "chat_template_kwargs": {"enable_thinking": False},
+                    "capability_rank": index + 1,
+                }
+                for index in range(2)
+            ]
+        ),
+        encoding="utf-8",
+    )
+    alias_parent = tmp_path / "alias"
+    alias_parent.mkdir()
+    capture_path = tmp_path / "request_capture.jsonl"
+    report_alias = alias_parent / ".." / capture_path.name
+
+    async def fake_sweep(task_rows, repeats, specs, concurrency, **kwargs):
+        return {
+            "anchor_ordering_ok": True,
+            "model_ordering": {"status": "PASS"},
+        }
+
+    monkeypatch.setattr(model_sweep_module, "_sweep", fake_sweep)
+    monkeypatch.setattr(model_sweep_module, "_print_report", lambda report: None)
+
+    with pytest.raises(SystemExit) as error:
+        main(
+            [
+                "--engineering-smoke",
+                "--models",
+                str(model_path),
+                "--request-capture-out",
+                str(capture_path),
+                "--out",
+                str(report_alias),
+            ]
+        )
+
+    assert error.value.code == 2
+    assert "different files" in capsys.readouterr().err
+    assert not capture_path.exists()
+
+
+def test_sweep_writes_complete_capture_and_fails_when_one_model_capture_is_missing(tmp_path: Path, monkeypatch):
+    specs = [
+        ModelSpec(
+            label=f"model-{index}",
+            model=f"model-{index}",
+            base_url=f"http://127.0.0.1:{18001 + index}/v1",
+            chat_template_kwargs={"enable_thinking": False},
+            capability_rank=index + 1,
+        )
+        for index in range(4)
+    ]
+    rows = _profile_task_rows(_load_example_rows(), task_count=1)
+
+    async def run_with_optional_skip(path: Path, skip_stats_index: int | None):
+        seen_stats = []
+
+        async def fake_run_episode(base_url, row, action_fn, stats):
+            if stats not in seen_stats:
+                seen_stats.append(stats)
+            stats_index = seen_stats.index(stats)
+            for step_index in range(16):
+                skip = stats_index == skip_stats_index and row["_profile_response_index"] == 1 and step_index == 15
+                if not skip:
+                    await action_fn(f"- Cell 0: capture {step_index}", step_index)
+            stats.finish_episode(
+                0.0,
+                scenario_id=row["scenario_id"],
+                tool_counts={"noop": 16},
+                rejected_steps=0,
+                episode_steps=16,
+                pair_key=(f"{row['_profile_prompt_index']}:{row['_profile_response_index']}"),
+                parse_failures=0,
+                invalid_calls=0,
+            )
+
+        monkeypatch.setattr(model_sweep_module, "_start_local_server", lambda: "http://unused")
+        monkeypatch.setattr(model_sweep_module, "_run_episode", fake_run_episode)
+        monkeypatch.setattr(
+            model_sweep_module.aiohttp,
+            "ClientSession",
+            lambda *args, **kwargs: _CaptureSession(),
+        )
+        return await _sweep(
+            rows,
+            repeats=2,
+            specs=specs,
+            concurrency=1,
+            run1b_profile=True,
+            request_capture_out=path,
+        )
+
+    complete = tmp_path / "complete.jsonl"
+    asyncio.run(run_with_optional_skip(complete, None))
+    assert len(complete.read_text(encoding="utf-8").splitlines()) == 128
+
+    with pytest.raises(ValueError, match="missing"):
+        asyncio.run(run_with_optional_skip(tmp_path / "missing.jsonl", 7))
+
+
 def test_llm_request_pins_identical_sampling_template_kwargs_and_pair_derived_seed_across_models():
     class Response:
         async def __aenter__(self):
@@ -864,10 +1458,7 @@ def test_llm_request_pins_identical_sampling_template_kwargs_and_pair_derived_se
         assert action == {"name": "noop", "arguments": {}}
 
     sampling_contracts = [
-        {
-            key: payload[key]
-            for key in ("temperature", "top_p", "max_tokens", "seed", "chat_template_kwargs")
-        }
+        {key: payload[key] for key in ("temperature", "top_p", "max_tokens", "seed", "chat_template_kwargs")}
         for payload in session.payloads
     ]
     assert sampling_contracts == [
@@ -1033,6 +1624,86 @@ def test_random_valid_never_repeats_within_rate_limit_window():
     # logical steps); the policy's dedupe must keep adjacent pairs distinct.
     assert all(keys[i] != keys[i - 1] for i in range(1, len(keys)))
     assert all(keys[i] != keys[i - 2] for i in range(2, len(keys)))
+
+
+@pytest.mark.parametrize(
+    ("prompt_count", "expected_episodes", "expected_capture_rows"),
+    [(1, 2, 128), (5, 10, 640)],
+)
+def test_run1b_capture_end_to_end_uses_real_sixteen_step_episode_support(
+    tmp_path: Path,
+    prompt_count: int,
+    expected_episodes: int,
+    expected_capture_rows: int,
+):
+    capture_path = tmp_path / "request_capture.jsonl"
+    partial_path = tmp_path / "request_capture.jsonl.partial"
+    publication_states: list[tuple[bool, bool]] = []
+
+    async def chat_completions(request: web.Request) -> web.Response:
+        payload = await request.json()
+        assert payload["model"] in {f"model-{index}" for index in range(4)}
+        publication_states.append((capture_path.exists(), partial_path.exists()))
+        return web.json_response(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [{"function": {"name": "noop", "arguments": "{}"}}],
+                            "content": None,
+                        }
+                    }
+                ]
+            }
+        )
+
+    async def run() -> dict:
+        app = web.Application()
+        app.router.add_post("/v1/chat/completions", chat_completions)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        port = _free_port()
+        site = web.TCPSite(runner, "127.0.0.1", port)
+        await site.start()
+        try:
+            specs = [
+                ModelSpec(
+                    label=f"model-{index}",
+                    model=f"model-{index}",
+                    base_url=f"http://127.0.0.1:{port}/v1",
+                    chat_template_kwargs={"enable_thinking": False},
+                    capability_rank=index + 1,
+                )
+                for index in range(4)
+            ]
+            rows = _profile_task_rows(_load_example_rows(), task_count=prompt_count)
+            return await _sweep(
+                rows,
+                repeats=2,
+                specs=specs,
+                concurrency=4,
+                run1b_profile=True,
+                request_capture_out=capture_path,
+            )
+        finally:
+            await runner.cleanup()
+
+    report = asyncio.run(run())
+
+    assert publication_states == [(False, True)] * expected_capture_rows
+    assert capture_path.is_file()
+    assert not partial_path.exists()
+    capture_records = [json.loads(line) for line in capture_path.read_text(encoding="utf-8").splitlines()]
+    assert len(capture_records) == expected_capture_rows
+    assert {record["coordinates"]["step_index"] for record in capture_records} == set(range(16))
+    assert report["episodes_per_policy"] == expected_episodes
+    by_policy = {row["policy"]: row for row in report["profile"]}
+    for index in range(4):
+        model = by_policy[f"model:model-{index}"]
+        assert model["episodes"] == expected_episodes
+        assert model["usable_episodes"] == expected_episodes
+        assert all(record["steps"] == 16 for record in model["episode_records"])
+        assert all(record["tool_counts"] == {"noop": 16} for record in model["episode_records"])
 
 
 def test_parse_topology_reads_cells_and_ues():
@@ -1257,6 +1928,69 @@ def test_run1b_profiles_require_thinking_disabled(chat_template_kwargs, profile_
                 repeats=1,
                 specs=specs,
                 **profile_kwargs,
+            )
+        )
+
+
+def test_run1b_profiles_reject_authenticated_model_endpoints_before_server_start(monkeypatch):
+    monkeypatch.setenv("RUN1B_TEST_KEY", "secret")
+    monkeypatch.setattr(
+        model_sweep_module,
+        "_start_local_server",
+        lambda: pytest.fail("Run 1B endpoint validation must precede server startup"),
+    )
+    spec = ModelSpec(
+        label="model",
+        model="model",
+        base_url="http://127.0.0.1:18001/v1",
+        api_key_env="RUN1B_TEST_KEY",
+        chat_template_kwargs={"enable_thinking": False},
+        capability_rank=1,
+    )
+
+    with pytest.raises(ValueError, match="unauthenticated local loopback"):
+        asyncio.run(
+            _sweep(
+                _profile_task_rows(_load_example_rows(), 1),
+                repeats=1,
+                specs=[spec],
+                run1b_profile=True,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://127.0.0.1:18001/v1",
+        "http://localhost:18001/v1",
+        "http://127.0.0.1:18001/v1/",
+        "http://127.0.0.1:18001/secret/v1",
+        "http://127.0.0.1:18001/v1?token=secret",
+        "http://127.0.0.1:70000/v1",
+    ],
+)
+def test_run1b_profiles_require_exact_safe_loopback_base_url_before_server_start(monkeypatch, base_url):
+    monkeypatch.setattr(
+        model_sweep_module,
+        "_start_local_server",
+        lambda: pytest.fail("Run 1B endpoint validation must precede server startup"),
+    )
+    spec = ModelSpec(
+        label="model",
+        model="model",
+        base_url=base_url,
+        chat_template_kwargs={"enable_thinking": False},
+        capability_rank=1,
+    )
+
+    with pytest.raises(ValueError, match=r"http://127\.0\.0\.1:<port>/v1"):
+        asyncio.run(
+            _sweep(
+                _profile_task_rows(_load_example_rows(), 1),
+                repeats=1,
+                specs=[spec],
+                run1b_profile=True,
             )
         )
 
